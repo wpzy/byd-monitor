@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-多标的投研看板（16 个 ETF / 个股）
+多标的投研看板（比亚迪 + 16 个 ETF / 个股，共 17 个标的）
 =====================================================================
 与 byd_monitor.py 共用数据层与技术指标，但区分两类分析口径：
 
@@ -41,6 +41,7 @@ PORTFOLIO_JSON = DATA_DIR / "portfolio.json"
 
 # symbol, market, kind, 简称, 板块
 UNIVERSE = [
+    ("002594", "sz", "STOCK", "比亚迪",       "新能源车"),
     ("518880", "sh", "ETF",   "黄金ETF",      "商品/避险"),
     ("512010", "sh", "ETF",   "医药ETF",      "医药"),
     ("512000", "sh", "ETF",   "券商ETF",      "证券"),
@@ -571,9 +572,10 @@ background:#fff;color:var(--sub);font-size:12px}
 </style></head><body><div class="wrap">
 <header>
  <div><h1>多标的投研看板</h1>
- <div class="small">数据时点 __ASOF__ ｜ 生成 __TIME__ ｜ 成功 __COUNT__ 个标的 ｜
+ <div class="small">数据时点 __ASOF__ ｜ 生成 __TIME__ ｜ 成功 __COUNT__ 个标的（含比亚迪）｜
  个股沿用比亚迪五维模型，ETF 以价格历史分位替代估值分位</div></div>
  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+  __BYD_LINK__
   <input id="pfToken" type="password" placeholder="刷新令牌（可选）" autocomplete="off"
    style="padding:7px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px;width:165px">
   <button class="btn" id="btnRefresh" onclick="refresh()">立即刷新数据</button>
@@ -612,7 +614,7 @@ background:#fff;color:var(--sub);font-size:12px}
 
 <section id="tab-method" hidden>
  <div class="card"><h2 style="margin-top:0">分析口径</h2>
- <div class="box"><b>个股（__STOCK_COUNT__ 只）</b>：沿用比亚迪五维模型 ——
+ <div class="box"><b>个股（__STOCK_COUNT__ 只，含比亚迪 002594）</b>：沿用比亚迪五维模型 ——
  估值 25%（PE/PB/PS 历史分位）、成长质量 25%（单季同比/ROE/毛利率）、
  趋势技术 25%、资金情绪 15%、风险 10%。</div>
  <div class="box"><b>ETF（__ETF_COUNT__ 只）</b>：ETF 无 PE/PB 与财报，改用
@@ -645,10 +647,154 @@ const tagCls = (t) => t === 'buy' ? 'sg-buy' : (t === 'sell' ? 'sg-sell' : 'sg-h
 const riskCls = (l) => l === '高' ? 'risk-hi' : (l === '中' ? 'risk-mid' : 'risk-lo');
 const byCode = (c) => ITEMS.find(x => x.symbol === c) || ITEMS[0];
 
-function chart(id, option) {
-  if (!window.echarts) return;
-  if (!charts[id]) charts[id] = echarts.init($(id));
-  charts[id].setOption(option, true);
+function chart(id, option, spec) {
+  const el = $(id);
+  if (!el) return;
+  // drawDetail() 会整体替换 #detail.innerHTML。若沿用缓存的 ECharts 实例，
+  // 实例仍绑定已被删除的旧 DOM 节点，切换标的后图表就会整片空白。
+  // 因此每次渲染都先 dispose，再对「当前」节点重新 init。
+  if (window.echarts) {
+    try {
+      if (charts[id]) { charts[id].dispose(); delete charts[id]; }
+      charts[id] = echarts.init(el);
+      charts[id].setOption(option, true);
+      return;
+    } catch (e) {
+      try { if (charts[id]) charts[id].dispose(); } catch (_) {}
+      delete charts[id];
+    }
+  }
+  el.innerHTML = svgChart(spec, el);
+}
+
+// 无第三方库依赖的内联 SVG 绘图：图表库不可用时兜底，页面永远不会留白。
+function svgChart(s, el) {
+  if (!s || !s.type) return '<div style="padding:18px;color:#667085;font-size:13px">' +
+    '图表数据不可用；上方表格已列出全部数值。</div>';
+  const W = Math.max(360, Math.round((el && el.clientWidth) || 900));
+  const H = Math.max(180, Math.round((el && el.clientHeight) ||
+    (s.type === 'kline' ? 340 : 250)));
+  const L = 62, R = 20, T = 20, B = 38;
+  const iw = W - L - R, ih = H - T - B;
+  const RED = '#d64545', GREEN = '#2e9e6b', BLUE = '#2f5fd0',
+        ORANGE = '#e0952f', GREY = '#8a94a6';
+  const T2 = (x, y, t, sz, anchor, color) => '<text x="' + Number(x).toFixed(1) +
+    '" y="' + Number(y).toFixed(1) + '" font-size="' + (sz || 10) +
+    '" fill="' + (color || '#667085') + '" text-anchor="' + (anchor || 'start') +
+    '" font-family="Arial,Microsoft YaHei,sans-serif">' + esc(t) + '</text>';
+  const LN = (x1, y1, x2, y2, c, w) => '<line x1="' + Number(x1).toFixed(1) +
+    '" y1="' + Number(y1).toFixed(1) + '" x2="' + Number(x2).toFixed(1) +
+    '" y2="' + Number(y2).toFixed(1) + '" stroke="' + (c || '#e4e8ef') +
+    '" stroke-width="' + (w || 1) + '"/>';
+  const RC = (x, y, w, h, c, r) => '<rect x="' + Math.max(0, Number(x)).toFixed(1) +
+    '" y="' + Math.max(0, Number(y)).toFixed(1) + '" width="' + Math.max(0.6, Number(w)).toFixed(1) +
+    '" height="' + Math.max(0.6, Number(h)).toFixed(1) + '" rx="' + (r || 0) +
+    '" fill="' + c + '"/>';
+  let g = '<rect x="0" y="0" width="' + W + '" height="' + H + '" fill="#fff"/>';
+
+  if (s.type === 'hbar') {
+    const v = s.values.map(Number);
+    const m = Math.max(20, ...v.map(x => Math.abs(x))) * 1.12;
+    const zx = L + iw / 2, sc = (iw / 2) / m, row = ih / Math.max(1, v.length);
+    for (let k = 0; k <= 4; k++) g += LN(L + iw * k / 4, T, L + iw * k / 4, T + ih, '#eef1f6');
+    v.forEach((val, i) => {
+      const y = T + i * row + row * 0.16, hh = row * 0.68;
+      const w = Math.abs(val) * sc, x = val >= 0 ? zx : zx - w;
+      g += RC(x, y, w, hh, (s.colors && s.colors[i]) || GREY, 2);
+      g += T2(L - 8, y + hh * 0.78, s.labels[i], 10, 'end', '#475467');
+      g += T2(val >= 0 ? Math.min(W - R - 26, x + w + 4) : Math.max(L + 2, x - 4),
+              y + hh * 0.78, n(val, 1), 9, val >= 0 ? 'start' : 'end', '#475467');
+    });
+    g += LN(zx, T, zx, T + ih, '#c9d2e0', 1.2);
+    g += T2(L, H - 10, n(-m, 0), 9, 'start') + T2(zx, H - 10, '0', 9, 'middle') +
+         T2(W - R, H - 10, n(m, 0), 9, 'end');
+  } else if (s.type === 'bars') {
+    const v = s.values.map(Number);
+    const m = Math.max(0.001, ...v.map(x => Math.abs(x)));
+    const zy = T + ih / 2, half = ih / 2 * 0.92;
+    const step = iw / Math.max(1, v.length), bw = Math.min(26, step * 0.66);
+    g += LN(L, zy, W - R, zy, '#c9d2e0', 1.2);
+    v.forEach((val, i) => {
+      const h = Math.abs(val) / m * half;
+      g += RC(L + (i + 0.5) * step - bw / 2, val >= 0 ? zy - h : zy, bw, h,
+              val >= 0 ? RED : GREEN, 1);
+    });
+    const ticks = Math.min(6, s.labels.length);
+    for (let k = 0; k < ticks; k++) {
+      const i = Math.round(k * (s.labels.length - 1) / Math.max(1, ticks - 1));
+      g += T2(L + (i + 0.5) * step, H - 12, String(s.labels[i]).slice(5), 9, 'middle');
+    }
+    g += T2(L - 6, T + 10, n(m, 1), 9, 'end') + T2(L - 6, zy - 4, '0', 9, 'end') +
+         T2(L - 6, T + ih, n(-m, 1), 9, 'end');
+  } else if (s.type === 'radar') {
+    const v = s.values.map(Number), lab = s.labels, N = Math.max(1, lab.length);
+    const cx = W / 2, cy = H / 2 + 4, rad = Math.min(iw, ih) * 0.44;
+    const pt = (i, r) => [cx + r * Math.sin(2 * Math.PI * i / N),
+                          cy - r * Math.cos(2 * Math.PI * i / N)];
+    [0.25, 0.5, 0.75, 1].forEach(f => {
+      const poly = [];
+      for (let i = 0; i < N; i++) { const p = pt(i, rad * f); poly.push(p[0].toFixed(1) + ',' + p[1].toFixed(1)); }
+      g += '<polygon points="' + poly.join(' ') + '" fill="' + (f === 1 ? '#fbfcfe' : 'none') +
+           '" stroke="#e4e8ef" stroke-width="1"/>';
+    });
+    const dp = [];
+    for (let i = 0; i < N; i++) {
+      const p = pt(i, rad), q = pt(i, rad * 1.2);
+      g += LN(cx, cy, p[0], p[1], '#e4e8ef');
+      g += T2(q[0], q[1] + 3, lab[i], 10, 'middle', '#475467');
+      const r = rad * Math.max(0, Math.min(1, (v[i] + 100) / 200)), d = pt(i, r);
+      dp.push(d[0].toFixed(1) + ',' + d[1].toFixed(1));
+      g += '<circle cx="' + d[0].toFixed(1) + '" cy="' + d[1].toFixed(1) + '" r="2.6" fill="' + BLUE + '"/>';
+    }
+    g += '<polygon points="' + dp.join(' ') + '" fill="rgba(47,95,208,.22)" stroke="' +
+         BLUE + '" stroke-width="2"/>';
+  } else if (s.type === 'kline') {
+    const o = s.ohlc || [], d = s.dates || [], N = o.length;
+    if (!N) return '<div style="padding:18px;color:#667085;font-size:13px">K 线数据不可用。</div>';
+    const ma = (s.ma20 || []).concat(s.ma60 || [])
+      .filter(x => x !== null && x !== undefined && isFinite(Number(x))).map(Number);
+    let hi = Math.max(...o.map(x => Number(x[3])), ...ma);
+    let lo = Math.min(...o.map(x => Number(x[2])), ...ma);
+    if (!(hi > lo)) hi = lo + 1;
+    const pad = (hi - lo) * 0.06; hi += pad; lo -= pad;
+    const priceH = ih * 0.70, volTop = T + ih * 0.76, volH = ih * 0.22;
+    const yP = v => T + priceH * (1 - (v - lo) / (hi - lo));
+    const step = iw / N, bw = Math.max(1, Math.min(9, step * 0.62));
+    const vmax = Math.max(1, ...(s.vols || []).map(Number));
+    for (let k = 0; k <= 4; k++) {
+      const yy = T + priceH * k / 4;
+      g += LN(L, yy, W - R, yy, '#eef1f6');
+      g += T2(L - 6, yy + 3, n(hi - (hi - lo) * k / 4, 2), 9, 'end');
+    }
+    g += LN(L, volTop + volH, W - R, volTop + volH, '#e4e8ef');
+    o.forEach((c, i) => {
+      const op = Number(c[0]), cl = Number(c[1]), lw = Number(c[2]), hg = Number(c[3]);
+      const x = L + (i + 0.5) * step, col = cl >= op ? RED : GREEN;
+      g += LN(x, yP(hg), x, yP(lw), col, 1);
+      const ya = yP(Math.max(op, cl)), yb = yP(Math.min(op, cl));
+      g += RC(x - bw / 2, ya, bw, yb - ya, col, 0.5);
+      const vh = Math.max(0, Number((s.vols || [])[i] || 0) / vmax * volH);
+      g += RC(x - bw / 2, volTop + volH - vh, bw, vh, col, 0.5);
+    });
+    [[s.ma20, ORANGE], [s.ma60, BLUE]].forEach(pair => {
+      const pts = [];
+      (pair[0] || []).forEach((v, i) => {
+        if (v !== null && v !== undefined && isFinite(Number(v)))
+          pts.push((L + (i + 0.5) * step).toFixed(1) + ',' + yP(Number(v)).toFixed(1));
+      });
+      if (pts.length > 1) g += '<polyline points="' + pts.join(' ') + '" fill="none" stroke="' +
+        pair[1] + '" stroke-width="1.4"/>';
+    });
+    const ticks = Math.min(6, N);
+    for (let k = 0; k < ticks; k++) {
+      const i = Math.round(k * (N - 1) / Math.max(1, ticks - 1));
+      g += T2(L + (i + 0.5) * step, H - 10, String(d[i] || '').slice(5), 9, 'middle');
+    }
+    g += T2(L, T - 6, 'K线', 10, 'start', '#475467') + T2(L + 40, T - 6, 'MA20', 10, 'start', ORANGE) +
+         T2(L + 92, T - 6, 'MA60', 10, 'start', BLUE) + T2(L + 144, T - 6, '成交量', 10, 'start', GREEN);
+  }
+  return '<svg viewBox="0 0 ' + W + ' ' + H + '" width="100%" height="100%" ' +
+    'preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg">' + g + '</svg>';
 }
 
 function showTab(name) {
@@ -674,7 +820,8 @@ function drawOverview() {
     series:[{type:'bar',data:sorted.map(r=>({value:r.total,
       itemStyle:{color:r.tag==='buy'?'#d64545':(r.tag==='sell'?'#2e9e6b':'#8a94a6'),borderRadius:3}})),
       barWidth:'62%',label:{show:true,position:'right',formatter:(p)=>n(p.value,1),fontSize:10,color:'#475467'}}]
-  });
+  }, {type:'hbar', labels:sorted.map(r=>r.alias), values:sorted.map(r=>r.total),
+      colors:sorted.map(r=>r.tag==='buy'?'#d64545':(r.tag==='sell'?'#2e9e6b':'#8a94a6'))});
   $('tiles').innerHTML = sorted.map(r => `
     <div class="tile" onclick="goDetail('${r.symbol}')">
       <div class="nm">${esc(r.alias)}</div>
@@ -795,7 +942,7 @@ function drawCharts(r){
       {name:'成交量',type:'bar',xAxisIndex:1,yAxisIndex:1,data:C.vols,
        itemStyle:{color:(p)=>C.ohlc[p.dataIndex][1]>=C.ohlc[p.dataIndex][0]?'#d64545':'#2e9e6b'}}
     ]
-  });
+  }, {type:'kline', dates:C.dates, ohlc:C.ohlc, vols:C.vols, ma20:C.ma20, ma60:C.ma60});
   const sc = Object.values(r.scores);
   chart('chartRadar', {
     animation:false,
@@ -806,7 +953,7 @@ function drawCharts(r){
     series:[{type:'radar',data:[{value:sc.map(s=>s.score),name:'评分',
       areaStyle:{color:'rgba(47,95,208,.18)'},lineStyle:{color:'#2f5fd0',width:2},
       itemStyle:{color:'#2f5fd0'}}]}]
-  });
+  }, {type:'radar', labels:sc.map(s=>s.label), values:sc.map(s=>s.score)});
   chart('chartFlow', {
     animation:false,
     tooltip:{trigger:'axis'},
@@ -815,7 +962,7 @@ function drawCharts(r){
     yAxis:{type:'value',splitLine:{lineStyle:{color:'#eef1f6'}},axisLabel:{fontSize:10}},
     series:[{type:'bar',data:C.flowMain.map(v=>({value:v,
       itemStyle:{color:v>=0?'#d64545':'#2e9e6b'}})),barWidth:'62%'}]
-  });
+  }, {type:'bars', labels:C.flowDates, values:C.flowMain});
 }
 
 function selectSymbol(code){ current = code; $('symbolSelect').value = code; drawDetail(); }
@@ -854,6 +1001,14 @@ init();
 def render_page(data, standalone=False):
     echarts = engine.echarts_script_tag() if standalone else \
         '<script src="/static/echarts.min.js"></script>'
+    if standalone:
+        byd_reports = sorted(REPORT_DIR.glob("BYD-002594-*.html"))
+        byd_link = (f'<a class="btn" style="text-decoration:none;display:inline-block;line-height:1.5" '
+                    f'href="./{html_mod.escape(byd_reports[-1].name)}">比亚迪全景研报</a>') \
+            if byd_reports else ""
+    else:
+        byd_link = ('<a class="btn" style="text-decoration:none;display:inline-block;line-height:1.5" '
+                    'href="/">比亚迪全景看板</a>')
     etf = sum(1 for r in data["items"] if r["kind"] == "ETF")
     stock = data["count"] - etf
     repl = {
@@ -863,6 +1018,7 @@ def render_page(data, standalone=False):
         "__ETF_COUNT__": str(etf), "__STOCK_COUNT__": str(stock),
         "__DISC__": html_mod.escape(DISCLAIMER),
         "__ECHARTS__": echarts,
+        "__BYD_LINK__": byd_link,
         "__DATA__": json.dumps(engine.clean_json(data), ensure_ascii=False, allow_nan=False),
     }
     out = PAGE_HTML

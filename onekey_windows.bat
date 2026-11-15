@@ -25,7 +25,7 @@ if errorlevel 1 (
   exit /b 1
 )
 
-echo [2/4] Fetching 16 ETF / stocks and building the report ...
+echo [2/4] Fetching 17 ETF / stocks (incl. BYD) and building the report ...
 python portfolio.py --once --workers 6
 if errorlevel 1 (
   echo [ERROR] Data fetch failed. Check network access to quote.eastmoney.com.

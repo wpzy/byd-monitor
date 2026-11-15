@@ -5,7 +5,7 @@
 #       sudo bash deploy/onekey.sh
 #
 #   自动完成：拉取代码 → 判断首次安装 / 增量更新 → 同步到 /opt/byd_monitor
-#   → 重启服务 → 触发 16 标的抓取 → 本机验收 → 输出访问地址。
+#   → 重启服务 → 触发 17 标的抓取 → 本机验收 → 输出访问地址。
 #   可重复执行（幂等）。首次使用它之前需先 git pull 一次把本脚本同步下来。
 #
 #   可选环境变量：APP_DIR（默认 /opt/byd_monitor）、PORT（默认 8767）
@@ -61,7 +61,7 @@ else
   curl -fsS --max-time 10 -X POST \
        "${BASE}/api/portfolio/refresh" >/dev/null 2>&1 || true
 fi
-log "已触发 16 标的抓取，等待缓存就绪"
+log "已触发 17 标的抓取，等待缓存就绪"
 
 PF_OK=0
 for _ in $(seq 1 60); do
