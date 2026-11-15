@@ -22,7 +22,11 @@ ENV_FILE="${ENV_DIR}/byd-monitor.env"
 SERVICE_FILE="/etc/systemd/system/byd-monitor.service"
 PORT="${PORT:-8767}"
 SSH_PORT="${SSH_PORT:-22}"
-ENABLE_UFW="${ENABLE_UFW:-1}"
+# 云服务器（含百度云 BCC）通常在控制台用安全组管控端口，默认不启用 UFW：
+# 一是避免与云平台防火墙重复，二是避免 SSH 端口非 22 时被 ufw 挡在外面。
+# 确需本机防火墙时显式启用，并同时给出真实 SSH 端口，例如：
+#   sudo env ENABLE_UFW=1 SSH_PORT=2222 bash deploy/ubuntu24/install.sh "$(pwd)"
+ENABLE_UFW="${ENABLE_UFW:-0}"
 UPDATE_HOUR="${UPDATE_HOUR:-15}"
 UPDATE_MINUTE="${UPDATE_MINUTE:-30}"
 
@@ -123,15 +127,18 @@ systemctl daemon-reload
 systemctl enable byd-monitor.service
 
 if [[ "${ENABLE_UFW}" == "1" ]]; then
-  log "配置 UFW：先保留 SSH，再开放 TCP ${PORT}"
+  log "配置 UFW：先保留 SSH（${SSH_PORT}/tcp），再开放 TCP ${PORT}"
   ufw allow "${SSH_PORT}/tcp"
   ufw allow "${PORT}/tcp"
   ufw --force enable
+else
+  log "跳过 UFW（默认）：请在云平台安全组中放行 TCP ${PORT}"
 fi
 
 log "启动服务并执行本机验收"
 systemctl restart byd-monitor.service
-"${APP_DIR}/deploy/ubuntu24/verify.sh" "127.0.0.1" "${PORT}"
+# 用 bash 显式调用，避免 git 未记录可执行位（100644）时安装最后一步 Permission denied
+bash "${APP_DIR}/deploy/ubuntu24/verify.sh" "127.0.0.1" "${PORT}"
 
 log "部署完成：http://<服务器IP>:${PORT}/"
 log "自动更新：每交易日 ${UPDATE_HOUR}:$(printf '%02d' "${UPDATE_MINUTE}")（北京时间）"

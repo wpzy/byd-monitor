@@ -1,0 +1,21 @@
+# 运行产物：由程序在服务器上自动生成，不入库，避免服务器上 git pull 冲突
+# 注意：这些目录此前已被提交过，需执行一次（本地仓库）：
+#   git rm -r --cached data report && git add .gitignore && git commit -m "chore: ignore runtime artifacts"
+data/
+report/
+
+# 本地环境与密钥（含 REFRESH_TOKEN，禁止入库）
+.env
+.env.local
+*.env
+
+# Python / 进程 / 日志
+__pycache__/
+*.pyc
+venv/
+.venv/
+*.log
+*.pid
+web_server.pid
+.DS_Store
+Thumbs.db

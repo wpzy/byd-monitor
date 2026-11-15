@@ -26,7 +26,8 @@ RUN mkdir -p /app/data/daily /app/data/cache /app/report
 
 EXPOSE 8767
 
+# 端口从环境变量读取，改 PORT 时健康检查依然有效
 HEALTHCHECK --interval=60s --timeout=10s --start-period=60s --retries=3 \
-  CMD python -c "import json,sys,urllib.request; d=json.load(urllib.request.urlopen('http://127.0.0.1:8767/health',timeout=8)); sys.exit(0 if d['ok'] else 1)"
+  CMD python -c "import json,os,sys,urllib.request; p=os.environ.get('PORT','8767'); d=json.load(urllib.request.urlopen('http://127.0.0.1:'+p+'/health',timeout=8)); sys.exit(0 if d['ok'] else 1)"
 
 CMD ["python", "-u", "byd_web_server.py"]
