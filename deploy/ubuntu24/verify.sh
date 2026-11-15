@@ -10,9 +10,9 @@ VERIFY_SYSTEMD="${VERIFY_SYSTEMD:-1}"
 
 log() { printf '[verify] %s\n' "$*"; }
 
-log "等待 ${BASE_URL}/health"
+log "等待 ${BASE_URL}/health（首次部署无缓存，服务会先同步抓取全量行情数据，最长等待 90 秒）"
 health_payload=""
-for _ in $(seq 1 30); do
+for _ in $(seq 1 90); do
   if health_payload="$(curl -fsS --max-time 5 "${BASE_URL}/health" 2>/dev/null)"; then
     break
   fi

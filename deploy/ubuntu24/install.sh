@@ -108,8 +108,16 @@ log "在 Ubuntu 系统 Python 上重建虚拟环境"
 systemctl stop byd-monitor.service 2>/dev/null || true
 rm -rf "${APP_DIR}/venv"
 runuser -u "${APP_USER}" -- python3 -m venv "${APP_DIR}/venv"
-runuser -u "${APP_USER}" -- \
-  "${APP_DIR}/venv/bin/python" -m pip install --upgrade pip setuptools wheel
+# 本项目零第三方依赖，pip 工具链自升级纯属可选；国内云访问 pypi.org 常超时，
+# 失败不能中断安装（此前会因 set -e 直接退出，导致 systemd 单元根本没装完）。
+if runuser -u "${APP_USER}" -- \
+     "${APP_DIR}/venv/bin/python" -m pip install --disable-pip-version-check \
+     --upgrade pip setuptools wheel >/dev/null 2>&1; then
+  log "venv 工具链已更新"
+else
+  log "跳过 pip 工具链更新（PyPI 不可达或已是最新）；本项目零第三方依赖，不影响运行"
+fi
+# requirements.txt 当前只有注释，pip 不会联网；保留标准写法便于以后追加依赖
 runuser -u "${APP_USER}" -- \
   "${APP_DIR}/venv/bin/python" -m pip install -r "${APP_DIR}/requirements.txt"
 
@@ -126,19 +134,31 @@ chmod 0644 "${SERVICE_FILE}"
 systemctl daemon-reload
 systemctl enable byd-monitor.service
 
+# 云服务器默认用安全组管控端口，不主动启用 UFW（避免 SSH 端口非 22 时被锁在外面）。
+# 但若 UFW 已经是 active，必须补一条放行规则，否则公网访问不到服务；
+# 这里只新增规则，不触碰已有 SSH 规则，也不改变 enable 状态。
 if [[ "${ENABLE_UFW}" == "1" ]]; then
   log "配置 UFW：先保留 SSH（${SSH_PORT}/tcp），再开放 TCP ${PORT}"
   ufw allow "${SSH_PORT}/tcp"
   ufw allow "${PORT}/tcp"
   ufw --force enable
+elif command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
+  log "检测到 UFW 已启用，仅新增放行 TCP ${PORT} 的规则（不改动现有 SSH 规则）"
+  ufw allow "${PORT}/tcp"
+  ufw status numbered 2>/dev/null | sed -n '1,12p' || true
 else
-  log "跳过 UFW（默认）：请在云平台安全组中放行 TCP ${PORT}"
+  log "UFW 未启用：请在云平台安全组中放行 TCP ${PORT}"
 fi
 
 log "启动服务并执行本机验收"
 systemctl restart byd-monitor.service
 # 用 bash 显式调用，避免 git 未记录可执行位（100644）时安装最后一步 Permission denied
-bash "${APP_DIR}/deploy/ubuntu24/verify.sh" "127.0.0.1" "${PORT}"
+if ! bash "${APP_DIR}/deploy/ubuntu24/verify.sh" "127.0.0.1" "${PORT}"; then
+  log "验收未通过：首次启动无缓存时会先全量抓取行情数据，服务可能仍在初始化"
+  log "查看日志：journalctl -u byd-monitor -n 60 --no-pager"
+  log "稍后重跑验收：bash ${APP_DIR}/deploy/ubuntu24/verify.sh 127.0.0.1 ${PORT}"
+  exit 1
+fi
 
 log "部署完成：http://<服务器IP>:${PORT}/"
 log "自动更新：每交易日 ${UPDATE_HOUR}:$(printf '%02d' "${UPDATE_MINUTE}")（北京时间）"
