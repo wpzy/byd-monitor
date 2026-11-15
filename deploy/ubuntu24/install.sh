@@ -85,6 +85,20 @@ fi
 install -d -o "${APP_USER}" -g "${APP_GROUP}" \
   "${APP_DIR}/data" "${APP_DIR}/data/daily" "${APP_DIR}/data/cache" "${APP_DIR}/report"
 
+# 关键：rsync -a 会把源码目录的属主与权限一并带过来。源码位于 /root 下时通常是
+# root:root 0755/0700，服务账号对 APP_DIR 没有写权限，下一步创建 venv 就会报
+# [Errno 13] Permission denied。必须在建 venv「之前」归还属主并修正权限。
+rm -rf "${APP_DIR}/venv"
+chown -R "${APP_USER}:${APP_GROUP}" "${APP_DIR}" "${STATE_DIR}"
+find "${APP_DIR}" -type d -exec chmod 0755 {} + 2>/dev/null || true
+find "${APP_DIR}" -type f -exec chmod 0644 {} + 2>/dev/null || true
+chmod 0755 "${APP_DIR}/deploy/ubuntu24/"*.sh "${APP_DIR}/deploy_web_server.sh" 2>/dev/null || true
+if ! runuser -u "${APP_USER}" -- test -w "${APP_DIR}"; then
+  echo "服务账号 ${APP_USER} 对 ${APP_DIR} 仍无写权限，无法继续" >&2
+  exit 1
+fi
+log "已修正 ${APP_DIR} 属主与权限（服务账号可写）"
+
 if [[ -f "${SOURCE_DIR}/.env" && ! -f "${ENV_FILE}" ]]; then
   install -m 0640 -o root -g "${APP_GROUP}" "${SOURCE_DIR}/.env" "${ENV_FILE}"
 elif [[ ! -f "${ENV_FILE}" ]]; then
@@ -120,8 +134,6 @@ fi
 # requirements.txt 当前只有注释，pip 不会联网；保留标准写法便于以后追加依赖
 runuser -u "${APP_USER}" -- \
   "${APP_DIR}/venv/bin/python" -m pip install -r "${APP_DIR}/requirements.txt"
-
-chown -R "${APP_USER}:${APP_GROUP}" "${APP_DIR}" "${STATE_DIR}"
 
 log "安装 systemd 服务"
 sed \
