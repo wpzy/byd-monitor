@@ -12,6 +12,8 @@ services:
       UPDATE_MINUTE: "30"
       SKIP_WEEKENDS: "1"
       RUN_ON_START: "1"
+      PORTFOLIO_AUTO: "1"
+      PORTFOLIO_WORKERS: "6"
       TZ: Asia/Shanghai
       PYTHONUNBUFFERED: "1"
       # REFRESH_TOKEN: "replace-me"

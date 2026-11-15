@@ -309,12 +309,20 @@ class DataSource:
         return data
 
     @property
+    def _is_sh(self):
+        m = self.cfg.get("market")
+        if m:
+            return str(m).lower() in ("sh", "1", "sse")
+        # 沪市：6 开头股票 / 5 开头 ETF·LOF / 9 开头 B 股；深市：0、1(ETF)、2、3 开头
+        return self.symbol.startswith(("5", "6", "9"))
+
+    @property
     def secid(self):
-        return ("1." if self.symbol.startswith(("6", "9")) else "0.") + self.symbol
+        return ("1." if self._is_sh else "0.") + self.symbol
 
     @property
     def txcode(self):
-        return ("sh" if self.symbol.startswith(("6", "9")) else "sz") + self.symbol
+        return ("sh" if self._is_sh else "sz") + self.symbol
 
     # ---- 实时报价：腾讯主源 ----
     def quote_tencent(self):

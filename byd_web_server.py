@@ -34,6 +34,14 @@ from urllib.parse import parse_qs, urlparse
 
 import byd_monitor as engine
 
+# 多标的看板是可选模块：即使 portfolio.py 缺失或导入失败，主服务仍须正常提供比亚迪看板
+try:
+    import portfolio as pf
+    PF_IMPORT_ERROR = None
+except Exception as _e:      # noqa: BLE001
+    pf = None
+    PF_IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
+
 BASE_DIR = Path(__file__).resolve().parent
 
 HOST = os.environ.get("HOST", "0.0.0.0")
@@ -44,6 +52,8 @@ CHECK_SECONDS = max(10, int(os.environ.get("SCHED_CHECK_SECONDS", "60")))
 SKIP_WEEKENDS = os.environ.get("SKIP_WEEKENDS", "1") != "0"
 REFRESH_TOKEN = os.environ.get("REFRESH_TOKEN", "").strip()
 RUN_ON_START = os.environ.get("RUN_ON_START", "1") != "0"
+PORTFOLIO_AUTO = os.environ.get("PORTFOLIO_AUTO", "1") != "0"
+PORTFOLIO_WORKERS = max(1, int(os.environ.get("PORTFOLIO_WORKERS", "6")))
 
 STATE_FILE = engine.DATA_DIR / "server_state.json"
 LATEST_FILE = engine.DATA_DIR / "latest.json"
@@ -219,6 +229,50 @@ def refresh_async(trigger="manual"):
     return True
 
 
+# ---------------------------------------------------------------------------
+# 多标的看板：独立刷新状态 / 后台线程，不阻塞主服务与比亚迪刷新
+# ---------------------------------------------------------------------------
+pf_lock = threading.Lock()
+PF = {
+    "refreshing": False, "last_run_at": None, "last_error": None,
+    "last_trigger": None, "run_count": 0, "generated_at": None, "count": 0,
+    "last_success_date": None,
+}
+
+
+def portfolio_refresh(trigger="manual"):
+    if pf is None or not pf_lock.acquire(blocking=False):
+        return False
+    PF["refreshing"] = True
+    PF["last_trigger"] = trigger
+    PF["last_run_at"] = f"{engine.now_cn():%Y-%m-%d %H:%M:%S}"
+    log(f"多标的看板开始刷新（{trigger}）：{len(pf.UNIVERSE)} 个标的")
+    try:
+        d = pf.run_all(workers=PORTFOLIO_WORKERS, quiet=True)
+        PF.update({"last_error": None, "run_count": PF["run_count"] + 1,
+                   "generated_at": d["generated_at"], "count": d["count"],
+                   "last_success_date": f"{engine.now_cn():%Y-%m-%d}"})
+        log(f"多标的看板刷新成功：{d['count']}/{d['count'] + d['failed']}，耗时 {d['elapsed']}s")
+    except Exception as e:      # noqa: BLE001
+        PF["last_error"] = f"{type(e).__name__}: {e}"
+        log(f"多标的看板刷新失败：{PF['last_error']}", "ERROR")
+    finally:
+        PF["refreshing"] = False
+        pf_lock.release()
+    return True
+
+
+def portfolio_async(trigger="manual"):
+    if pf is None or pf_lock.locked():
+        return False
+    threading.Thread(target=portfolio_refresh, args=(trigger,), daemon=True).start()
+    return True
+
+
+def portfolio_data():
+    return pf.load_cached() if pf else None
+
+
 def scheduler_loop():
     log(f"定时调度已启动：{SCHEDULE_TEXT}，检查间隔 {CHECK_SECONDS}s")
     while not stop_event.is_set():
@@ -231,6 +285,11 @@ def scheduler_loop():
             if due_time and weekday_ok and not done_today:
                 ok, msg = run_refresh("scheduled")
                 log(f"定时刷新{'成功' if ok else '失败'}：{msg}", "INFO" if ok else "ERROR")
+            # 多标的看板独立调度：不依赖比亚迪刷新是否成功，同日幂等
+            if (due_time and weekday_ok and PORTFOLIO_AUTO and pf is not None
+                    and not PF["refreshing"]
+                    and PF["last_success_date"] != f"{now:%Y-%m-%d}"):
+                portfolio_async("scheduled")
         except Exception as e:      # noqa: BLE001
             log(f"调度循环异常：{type(e).__name__}: {e}", "ERROR")
         stop_event.wait(CHECK_SECONDS)
@@ -354,6 +413,8 @@ ul{margin:8px 0;padding-left:20px}
 </head>
 <body><div class="wrap">
 <h1>__TITLE__</h1>
+<div style="margin:0 0 12px"><a href="/portfolio" style="display:inline-block;padding:7px 14px;border:1px solid #2f5fd0;border-radius:8px;background:#2f5fd0;color:#fff;text-decoration:none;font-size:13px">→ 多标的投研看板（16 个 ETF / 个股）</a>
+<span class="small" style="margin-left:10px">横向对比 · 风险点位 · 条件化买入建议</span></div>
 <div class="meta small" style="margin-bottom:14px">__NAME__（__CODE__.SZ，A 股 / 人民币）｜ 数据时点 __ASOF__ ｜ __STATE__ ｜ 页面生成 __GEN__</div>
 
 <div class="topbar">
@@ -781,6 +842,11 @@ class BydRequestHandler(BaseHTTPRequestHandler):
                     "refresh_in_progress": S["refreshing"],
                     "schedule": SCHEDULE_TEXT,
                     "timezone": "Asia/Shanghai (UTC+8)",
+                    "portfolio": {"module": "ok" if pf else "unavailable",
+                                  "cache_exists": portfolio_data() is not None,
+                                  "refreshing": PF["refreshing"],
+                                  "generated_at": PF["generated_at"],
+                                  "count": PF["count"]},
                 })
                 return
             if path == "/api/status":
@@ -835,6 +901,37 @@ class BydRequestHandler(BaseHTTPRequestHandler):
                 self.send_json({"count": len(load_history(int(days or 60))),
                                 "items": load_history(int(days or 60))})
                 return
+            if path == "/portfolio":
+                if pf is None:
+                    self.send_json({"error": f"多标的模块不可用：{PF_IMPORT_ERROR}"},
+                                   status=HTTPStatus.SERVICE_UNAVAILABLE)
+                    return
+                d = portfolio_data()
+                if not d:
+                    portfolio_async("on-demand")
+                    self.send_html(pf.render_page(
+                        {"generated_at": f"{engine.now_cn():%Y-%m-%d %H:%M:%S}",
+                         "asof": "数据抓取中", "count": 0, "failed": 0,
+                         "items": [], "errors": [], "disclaimer": pf.DISCLAIMER},
+                        standalone=False))
+                    return
+                self.send_html(pf.render_page(d, standalone=False))
+                return
+            if path == "/api/portfolio":
+                d = portfolio_data()
+                if d is None:
+                    self.send_json({"error": "多标的数据未就绪",
+                                    "import_error": PF_IMPORT_ERROR},
+                                   status=HTTPStatus.SERVICE_UNAVAILABLE)
+                else:
+                    self.send_json(d)
+                return
+            if path == "/api/portfolio/status":
+                self.send_json({**PF, "module": "ok" if pf else "unavailable",
+                                "import_error": PF_IMPORT_ERROR,
+                                "auto": PORTFOLIO_AUTO,
+                                "cache_exists": portfolio_data() is not None})
+                return
             if path == "/report":
                 ctx = S["ctx"]
                 if ctx is None:
@@ -869,7 +966,8 @@ class BydRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
-        if parsed.path != "/api/refresh":
+        path = parsed.path
+        if path not in ("/api/refresh", "/api/portfolio/refresh"):
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
             return
         # 无论客户端是否带 body，都读完，避免 HTTP/1.1 连接复用串包
@@ -885,6 +983,14 @@ class BydRequestHandler(BaseHTTPRequestHandler):
                 self.send_json({"error": "刷新令牌无效，请在 X-Refresh-Token 请求头中携带 REFRESH_TOKEN"},
                                status=HTTPStatus.UNAUTHORIZED)
                 return
+        if path == "/api/portfolio/refresh":
+            started = portfolio_async("manual")
+            self.send_json({
+                "started": started, "status": {**PF},
+                "message": "已在后台启动多标的抓取，完成后刷新 /portfolio 页面" if started
+                           else "已有刷新任务在运行，请稍候",
+            }, status=HTTPStatus.ACCEPTED if started else HTTPStatus.CONFLICT)
+            return
         started = refresh_async("manual")
         self.send_json({
             "started": started,
@@ -937,12 +1043,18 @@ def main():
         pass
 
     load_persisted()
+    pf_cached = portfolio_data()
+    if pf_cached:
+        PF["generated_at"] = pf_cached.get("generated_at")
+        PF["count"] = pf_cached.get("count", 0)
     S["next_run_at"] = compute_next_run().isoformat(timespec="seconds")
     if RUN_ON_START and S["ctx"] is None:
         log("未找到分析缓存，启动时先执行一次全量抓取")
         run_refresh("startup")
 
     threading.Thread(target=scheduler_loop, daemon=True).start()
+    if PORTFOLIO_AUTO and pf is not None and portfolio_data() is None:
+        portfolio_async("startup")
 
     try:
         server = BydHTTPServer((HOST, PORT), BydRequestHandler)
