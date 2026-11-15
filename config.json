@@ -1,0 +1,48 @@
+{
+  "symbol": "002594",
+  "name": "比亚迪",
+  "cost_price": null,
+  "risk_profile": "balanced",
+  "holding_horizon": "medium",
+  "analyst_eps_forecast": null,
+  "valuation_years": 5,
+  "kline_days": 420,
+  "weights": {
+    "valuation": 0.25,
+    "growth": 0.25,
+    "trend": 0.25,
+    "fund": 0.15,
+    "risk": 0.10
+  },
+  "alerts": {
+    "pct_change": 4.0,
+    "gap_pct": 2.0,
+    "volume_ratio": 2.0,
+    "rsi_oversold": 30,
+    "rsi_overbought": 70,
+    "main_flow_threshold_yuan": 100000000,
+    "take_profit_pct": 15.0,
+    "stop_loss_pct": -8.0,
+    "trailing_start_pct": 5.0,
+    "trailing_drawdown_pct": 10.0,
+    "pe_low_percentile": 20,
+    "pe_high_percentile": 80,
+    "key_levels": []
+  },
+  "watch": {
+    "interval_trading": 60,
+    "interval_idle": 300,
+    "full_refresh_minutes": 30,
+    "webhook": "",
+    "webhook_type": "wecom"
+  },
+  "_说明": {
+    "cost_price": "填你的持仓成本价（元），用于止盈/止损/动态止盈告警；不填则不计算",
+    "analyst_eps_forecast": "填你自己认可的未来12个月 EPS 预测（元），用于前瞻 PE；留空则显示 N/A，程序不会编造预测值",
+    "risk_profile": "conservative / balanced / aggressive，影响信号措辞",
+    "holding_horizon": "short / medium / long，影响交易计划周期",
+    "alerts.key_levels": "留空表示自动取 52周低点、MA20、MA60、MA250 作为关键位；也可手填价格数组",
+    "watch.webhook": "企业微信/钉钉机器人地址，留空则只输出到控制台和日志文件",
+    "免责": "所有行情、财务、估值数据均在运行时从公开接口动态获取，配置文件中不含任何行情数值"
+  }
+}

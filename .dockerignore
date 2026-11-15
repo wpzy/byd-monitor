@@ -1,0 +1,14 @@
+.git/
+.gitignore
+.trae/
+__pycache__/
+*.pyc
+venv/
+.venv/
+data/
+report/
+*.log
+*.pid
+web_server.pid
+.env
+.env.local

@@ -1,0 +1,21 @@
+services:
+  byd-monitor:
+    build: .
+    image: byd-monitor:latest
+    container_name: byd-monitor
+    ports:
+      - "8767:8767"
+    environment:
+      HOST: 0.0.0.0
+      PORT: "8767"
+      UPDATE_HOUR: "15"
+      UPDATE_MINUTE: "30"
+      SKIP_WEEKENDS: "1"
+      RUN_ON_START: "1"
+      TZ: Asia/Shanghai
+      PYTHONUNBUFFERED: "1"
+      # REFRESH_TOKEN: "replace-me"
+    volumes:
+      - ./data:/app/data
+      - ./report:/app/report
+    restart: unless-stopped

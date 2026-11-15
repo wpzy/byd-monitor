@@ -1,0 +1,29 @@
+[Unit]
+Description=BYD Monitor web service (stock quote, valuation and signal dashboard)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=bydmon
+Group=bydmon
+WorkingDirectory=/opt/byd_monitor
+EnvironmentFile=-/etc/byd-monitor/byd-monitor.env
+ExecStart=/opt/byd_monitor/venv/bin/python -u /opt/byd_monitor/byd_web_server.py
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+
+# 服务会把每日快照、缓存与归档研报写在工作目录下
+ReadWritePaths=/opt/byd_monitor /var/lib/byd-monitor
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

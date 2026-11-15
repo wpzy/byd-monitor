@@ -1,0 +1,10 @@
+# BYD Monitor Server 运行依赖
+#
+# 核心服务只使用 Python 标准库（http.server / urllib / json / ssl / threading），
+# 分析引擎同样零第三方依赖，因此本文件不需要任何安装包。
+#
+# 保留此文件是为了让 Dockerfile、deploy/ubuntu24/install.sh 中的
+# `pip install -r requirements.txt` 不会因为文件缺失而失败
+# （原 xbox_crawler 项目引用了 requirements.txt 但仓库里没有该文件）。
+#
+# 若将来引入第三方库（如 gunicorn / requests），在此按标准格式追加即可。
