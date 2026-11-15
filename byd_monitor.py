@@ -604,14 +604,18 @@ class DataSource:
                    data[-1]["date"] if data else None)
         return data
 
-    # ---- 每日主力资金流 ----
+    # ---- 每日主力资金流（东财多节点冗余）----
+    # 云服务器上常见「push2his 连接被远端直接关闭」，单一数据源会让全部标的的
+    # 资金维度一起失效。这里按「主 HTTPS → HTTP → 数字节点」逐级降级；任一级
+    # 拿到 >=5 条有效记录即采用，并把实际来源写进第七节数据源清单。
     def fundflow(self, lmt=60):
-        url = (f"https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get?secid={self.secid}"
-               f"&fields1=f1,f2,f3,f7&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65"
-               f"&klt=101&lmt={lmt}")
+        q = (f"/api/qt/stock/fflow/daykline/get?secid={self.secid}"
+             f"&fields1=f1,f2,f3,f7"
+             f"&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65"
+             f"&klt=101&lmt={lmt}")
 
-        def produce():
-            j = json.loads(http_get(url, timeout=20))
+        def parse(raw):
+            j = json.loads(raw)
             lines = ((j.get("data") or {}).get("klines") or [])
             out = []
             for line in lines:
@@ -629,10 +633,42 @@ class DataSource:
                     "close": num(p[11]),
                     "pct": num(p[12]),
                 })
-            return out
+            return [x for x in out if x["date"] and x.get("main_net") is not None]
 
-        data = self._cached("flow-" + url, 20, produce)
-        self._mark("东方财富 push2his（每日主力资金流）", url,
+        sources = (
+            ("东方财富 push2his（每日主力资金流）", "https://push2his.eastmoney.com" + q, 2, 12),
+            ("东方财富 push2his（HTTP 备用）", "http://push2his.eastmoney.com" + q, 1, 8),
+            ("东方财富 33 节点（每日主力资金流）", "https://33.push2his.eastmoney.com" + q, 1, 8),
+            ("东方财富 82 节点（每日主力资金流）", "https://82.push2his.eastmoney.com" + q, 1, 8),
+            ("东方财富 46 节点（每日主力资金流）", "https://46.push2his.eastmoney.com" + q, 1, 8),
+        )
+        used = {}
+
+        def produce():
+            failures = []
+            for label, url, retries, timeout in sources:
+                try:
+                    data = parse(http_get(url, timeout=timeout, retries=retries))
+                    if len(data) < 5:
+                        failures.append(f"{label}：仅 {len(data)} 条有效记录")
+                        continue
+                    used.update({"name": label, "url": url, "failures": failures})
+                    return data
+                except Exception as e:      # noqa: BLE001 - 单源失败继续下一源
+                    failures.append(f"{label}：{type(e).__name__}: {e}")
+            # 全失败抛异常：_cached 不会把空结果写进 20 分钟缓存，下次立即重试
+            raise DataError("全部资金流数据源不可用 → " + "；".join(failures[-4:]))
+
+        # 换 key 可绕开旧版可能已落盘的空资金流缓存
+        data = self._cached(f"flow-v3-{self.symbol}-{lmt}", 20, produce)
+        if used:
+            if used["failures"]:
+                self.warnings.append("资金流主源不可用，已回退 " + used["name"] +
+                                     "（" + "；".join(used["failures"][:2]) + "）")
+            name = used["name"]
+        else:
+            name = "每日资金流缓存（20 分钟内复用）"
+        self._mark(name, used.get("url") or ("https://push2his.eastmoney.com" + q),
                    data[-1]["date"] if data else None)
         return data
 

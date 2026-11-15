@@ -161,6 +161,8 @@ def score_volatility(ind, closes, price):
 def score_fund_etf(flow, kl, q):
     """按「主力净流 / 同期成交额」衡量，规避 ETF 规模口径差异。"""
     detail, s = [], 0.0
+    if not flow:
+        detail.append("资金流数据缺失，近 5/20 日主力净额不计分（本维度仅用量比与量能，总分偏中性）")
     if flow and kl:
         amts = [x.get("amount") or 0 for x in kl[-20:]]
         amt = sum(amts) / len(amts) if amts else 0
@@ -443,10 +445,14 @@ def build_narrative(ctx, kind, price, scores, total, decision, levels, flow_ev, 
                     f"年化波动率 {fmt(levels.get('vol_annual'), 1, '%')}。")
         bits.append(f"ETF 无 PE/PB 与财报，估值维度以价格历史分位替代；"
                     f"近 20 日涨跌 {fmt(q.get('chg_20d'), 2, '%')}，实时量比 {fmt(q.get('volume_ratio'))}。")
-    bits.append(f"主力资金近 5 日净额 {fmt(flow_ev['sum5_yi'], 2, ' 亿元')}、"
-                f"近 20 日 {fmt(flow_ev['sum20_yi'], 2, ' 亿元')}"
-                f"（占同期成交额 {fmt(flow_ev['sum20_pct'], 2, '%')}）；"
-                f"MA20 {fmt(ind.get('ma20'))} / MA60 {fmt(ind.get('ma60'))}，"
+    if flow_ev.get("available", True) and flow_ev.get("sum5_yi") is not None:
+        bits.append(f"主力资金近 5 日净额 {fmt(flow_ev['sum5_yi'], 2, ' 亿元')}、"
+                    f"近 20 日 {fmt(flow_ev['sum20_yi'], 2, ' 亿元')}"
+                    f"（占同期成交额 {fmt(flow_ev['sum20_pct'], 2, '%')}）；")
+    else:
+        bits.append("主力资金数据源本次未取到，资金情绪维度按中性 0 分计入、"
+                    "不代表净额为零，综合评分因此偏中性，请刷新复核后再用于决策；")
+    bits.append(f"MA20 {fmt(ind.get('ma20'))} / MA60 {fmt(ind.get('ma60'))}，"
                 f"RSI6 {fmt(ind.get('rsi6'), 1)}，MACD 柱 {fmt(ind.get('macd_hist'), 3)}。")
     if decision["tag"] == "hold":
         bits.append("当前矛盾是「位置/估值不贵但量价与资金仍在左侧」：右侧确认前不追买，"
@@ -530,6 +536,13 @@ def build_evidence(ctx, kind, price, levels, advice, total, decision, scores):
     amt20 = sum((x.get("amount") or 0) for x in kl[-20:])
     s5 = sum((x.get("main_net") or 0) for x in flow[-5:])
     s20 = sum((x.get("main_net") or 0) for x in flow[-20:])
+    # 关键：抓数失败 / 0 条记录时，绝不能把「没有数据」写成 0.00 亿。
+    # 0.00 亿会被误读成「主力净额恰好为零」，进而污染结论叙述与页面判断。
+    flow_ok = bool(flow)
+    flow_reason = ""
+    if not flow_ok:
+        hits = [w for w in ctx.get("warnings", []) if "flow" in w or "资金流" in w]
+        flow_reason = "；".join(hits) or "东财资金流接口本次未返回有效记录"
     flow_ev = {
         "dates": [x["date"] for x in flow],
         "main": [_yi(x.get("main_net")) for x in flow],
@@ -538,8 +551,11 @@ def build_evidence(ctx, kind, price, levels, advice, total, decision, scores):
         "mid": [_yi(x.get("mid_net")) for x in flow],
         "small": [_yi(x.get("small_net")) for x in flow],
         "cum": cum,
-        "sum5_yi": _r(s5 / 1e8, 4), "sum20_yi": _r(s20 / 1e8, 4),
-        "sum20_pct": _r(s20 / amt20 * 100, 2) if amt20 else None,
+        "available": flow_ok,
+        "reason": flow_reason,
+        "sum5_yi": _r(s5 / 1e8, 4) if flow_ok else None,
+        "sum20_yi": _r(s20 / 1e8, 4) if flow_ok else None,
+        "sum20_pct": (_r(s20 / amt20 * 100, 2) if amt20 else None) if flow_ok else None,
         "start": flow[0]["date"] if flow else None,
         "end": flow[-1]["date"] if flow else None,
         "table": [{
@@ -1575,21 +1591,33 @@ function drawDetail() {
           + '这些风险需结合基金定期报告与交易所申赎清单判断，本页不给出未核实的估算值。') + '</div></div>';
   }
 
-  // 五、资金情绪
+  // 五、资金情绪：数据源失败时明确标注「未取到」，绝不能呈现成 0.00 亿 + 空白图
   const flRows = (FL.table || []).map(x => tr([esc(x.d),
     '<b class="' + cls(x.main) + '">' + sign(x.main,3) + '</b>', sign(x.jumbo,3),
     sign(x.big,3), sign(x.mid,3), sign(x.small,3),
     sign(x.pct,2,'%'), vOr(x.close,3), sign(x.chg,2,'%')], [1,2,3,4,5,6,7,8])).join('');
+  const flowOk = FL.available !== false && (FL.dates || []).length > 0;
+  const flowWarn = (QU.warnings || []).filter(x => /flow|资金流/.test(x)).join('<br>');
+  const flowAlert = flowOk ? '' :
+    '<div class="box warn"><b>本节数据本次未取到 —— 下方 N/A 不代表「主力净额为 0」</b><br>' +
+    esc(flowWarn || FL.reason || '东财 push2his 资金流接口未返回有效记录。') +
+    '<br>本次资金情绪维度按中性 0 分计入，综合评分因此偏中性；估值、技术面、财务、风险点位等其余章节不受影响。' +
+    '<br>请点击右上角「立即刷新数据」重试，或在服务器访问 /api/diagnostics 检查数据源连通性。</div>';
+  const flowTable = flowOk
+    ? mkTable(['日期','主力净额','超大单','大单','中单','小单','主力占比','收盘','当日涨跌'], [flRows], 'tbl-sm')
+    : mkTable(['日期','主力净额','超大单','大单','中单','小单','主力占比','收盘','当日涨跌'],
+        [tr(['<span colspan="9" class="small">本次未取到资金流数据，暂无逐日明细；缺失值不按 0 填充。</span>'])], 'tbl-sm');
   const sec5 = '<div class="card sect"><h2>五、资金情绪（主力 = 超大单 + 大单）</h2>' +
+    flowAlert +
     '<div class="kpis">' +
     '<div class="kpi"><div class="k">近 5 日主力净额</div><div class="v ' + cls(FL.sum5_yi) + '">' + sign(FL.sum5_yi,2,' 亿') + '</div></div>' +
     '<div class="kpi"><div class="k">近 20 日主力净额</div><div class="v ' + cls(FL.sum20_yi) + '">' + sign(FL.sum20_yi,2,' 亿') + '</div></div>' +
     '<div class="kpi"><div class="k">20 日净额 / 同期成交额</div><div class="v ' + cls(FL.sum20_pct) + '">' + sign(FL.sum20_pct,2,'%') + '</div></div>' +
     '<div class="kpi"><div class="k">区间</div><div class="v" style="font-size:14px">' + esc(FL.start||'N/A') + ' ~ ' + esc(FL.end||'N/A') + '</div></div></div>' +
-    '<div id="chartFlow" class="chart-mid"></div>' +
+    (flowOk ? '<div id="chartFlow" class="chart-mid"></div>' : '') +
     '<h3>逐日资金流（近 20 交易日，单位亿元）</h3><div class="scroll">' +
-    mkTable(['日期','主力净额','超大单','大单','中单','小单','主力占比','收盘','当日涨跌'], [flRows], 'tbl-sm') +
-    '</div><p class="small">来源：东财 push2his fflow/daykline；分档口径由接口返回，累计线为区间主力净额累加。</p></div>';
+    flowTable +
+    '</div><p class="small">来源：东财 push2his fflow/daykline（HTTPS / HTTP / 数字节点多源回退）；分档口径由接口返回，累计线为区间主力净额累加。</p></div>';
 
   // 六、风险点位与条件化交易计划
   const lvRows = [
@@ -1769,24 +1797,28 @@ function drawCharts(r) {
     }, {type:'bars', labels:ks.map(k=>k+'日'), values:vals});
   }
 
-  // 5. 资金流：当日柱 + 累计线
+  // 5. 资金流：当日柱 + 累计线（无数据时不画空白坐标轴，页面已给出可读提示）
   const fd = FL.dates || [], fm = FL.main || [], fc = FL.cum || [];
-  chart('chartFlow', {
-    animation:false, tooltip:{trigger:'axis'},
-    legend:{data:['当日主力净额','累计净额'],top:0,textStyle:{fontSize:10}},
-    grid:{left:54,right:54,top:30,bottom:44},
-    xAxis:{type:'category',data:fd,axisLabel:{fontSize:9,rotate:45,color:'#667085'}},
-    yAxis:[{type:'value',name:'当日(亿)',splitLine:{lineStyle:{color:'#eef1f6'}}},
-           {type:'value',name:'累计(亿)'}],
-    series:[
-      {name:'当日主力净额',type:'bar',data:fm.map(v=>({value:v,
-        itemStyle:{color:v>=0?'#d64545':'#2e9e6b'}})),barWidth:'60%'},
-      {name:'累计净额',type:'line',yAxisIndex:1,data:fc,smooth:true,showSymbol:false,
-        lineStyle:{width:2,color:'#2f5fd0'}}
-    ]
-  }, {type:'combo', labels:fd,
-      bars:[{name:'主力',values:fm,color:'#2f5fd0'}],
-      line:{name:'累计',values:fc,color:'#e0952f'}});
+  if (fd.length) {
+    chart('chartFlow', {
+      animation:false, tooltip:{trigger:'axis'},
+      legend:{data:['当日主力净额','累计净额'],top:0,textStyle:{fontSize:10}},
+      grid:{left:54,right:54,top:30,bottom:44},
+      xAxis:{type:'category',data:fd,axisLabel:{fontSize:9,rotate:45,color:'#667085'}},
+      yAxis:[{type:'value',name:'当日(亿)',splitLine:{lineStyle:{color:'#eef1f6'}}},
+             {type:'value',name:'累计(亿)'}],
+      series:[
+        {name:'当日主力净额',type:'bar',data:fm.map(v=>({value:v,
+          itemStyle:{color:v>=0?'#d64545':'#2e9e6b'}})),barWidth:'60%'},
+        {name:'累计净额',type:'line',yAxisIndex:1,data:fc,smooth:true,showSymbol:false,
+          lineStyle:{width:2,color:'#2f5fd0'}}
+      ]
+    }, {type:'combo', labels:fd,
+        bars:[{name:'主力',values:fm,color:'#2f5fd0'}],
+        line:{name:'累计',values:fc,color:'#e0952f'}});
+  } else if (charts['chartFlow']) {
+    charts['chartFlow'].dispose(); delete charts['chartFlow'];
+  }
 }
 
 function selectSymbol(code){ current = code; $('symbolSelect').value = code; drawDetail(); }
