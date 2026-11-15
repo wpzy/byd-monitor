@@ -328,6 +328,276 @@ def build_advice(decision, levels, kind):
 
 
 # ---------------------------------------------------------------------------
+# 研报级证据包：让每个标的都保留与比亚迪全景研报同等级的可追溯依据
+# ---------------------------------------------------------------------------
+ETF_NO_FUNDAMENTALS = (
+    "ETF 是基金份额而非上市公司，本身不披露个股口径的 PE/PB、营业收入、归母净利与资产负债表；"
+    "东方财富 RPT_VALUEANALYSIS_DET / RPT_LICO_FN_CPD 对 ETF 无有效记录。"
+    "因此本看板不把空数据伪装成 0 分，也不套用个股财报模型：改用近 3 年前复权价格分位替代估值分位，"
+    "并以波动回撤、量能、主力资金占同期成交额比、短期动量构成五维。"
+    "ETF 另有的跟踪误差、折溢价、成份集中度与申赎流动性风险，历史行情无法完全刻画，"
+    "需另查基金定期报告与交易所申赎清单，本页不给出未经核实的估算值。"
+)
+
+
+def _r(v, d=4):
+    """统一浮点精度，避免页面出现长小数。"""
+    return round(v, d) if isinstance(v, float) and math.isfinite(v) else v
+
+
+def _sample(seq, cap):
+    """等间隔降采样，保留末点，控制内嵌 JSON 体积。"""
+    seq = list(seq)
+    if len(seq) <= cap:
+        return seq
+    step = math.ceil(len(seq) / cap)
+    out = seq[::step]
+    if out[-1] is not seq[-1]:
+        out.append(seq[-1])
+    return out
+
+
+def _chg(closes, n):
+    """由前复权日 K 自算的区间涨跌幅（%）。"""
+    if len(closes) <= n or not closes[-n - 1]:
+        return None
+    return (closes[-1] / closes[-n - 1] - 1) * 100
+
+
+def _yi(v):
+    return _r((v or 0) / 1e8, 4)
+
+
+def build_scenarios(ctx, kind, kl, price):
+    """情景区间：个股用 PE 分位 × EPS(TTM)，ETF 用近 3 年收盘价分位。"""
+    if kind == "STOCK":
+        plan = ctx.get("plan") or {}
+        eps = plan.get("eps_ttm")
+        out = []
+        for s in plan.get("scenarios", []):
+            pe, pv = s.get("pe"), s.get("price")
+            if pe is None or pv is None:
+                continue
+            out.append({
+                "label": s["label"],
+                "basis": f"PE {pe:.2f}x × EPS(TTM) {fmt(eps, 3)} 元",
+                "price": _r(pv, 4),
+                "delta": _r((pv / price - 1) * 100, 2) if price else None,
+            })
+        note = ("情景价 = 历史 PE 分位 × 当前 EPS(TTM)，为估值区间推演，不是目标价预测；"
+                "EPS 不变假设下才成立，盈利下修时整条区间同步下移。")
+        sq = (ctx.get("singles") or [])[-1] if ctx.get("singles") else {}
+        jump = sq.get("np_yoy")
+        extreme = any(abs(s["delta"] or 0) > 150 for s in out)
+        if extreme or (jump is not None and jump > 100):
+            note += (f" ⚠️ 本次最新单季（{sq.get('year','')}Q{sq.get('q','')}）归母净利同比 "
+                     f"{fmt(jump, 1, '%')}，当前 PE 处于历史极低分位；历史 PE 中枢对应的是旧盈利水平，"
+                     "把它直接套到当前 EPS 上会显著放大情景价。请同步参考下方「近 3 年价格分位」交叉锚，"
+                     "并核实盈利可持续性，切勿把该区间当作目标价。")
+        return out, note
+    seg = [x["close"] for x in kl[-750:] if x.get("close")]
+    out = []
+    for label, q in (("低位 25% 分位", 0.25), ("中枢 50% 分位", 0.50), ("高位 75% 分位", 0.75)):
+        v = engine.quantile(seg, q) if seg else None
+        if v is None:
+            continue
+        out.append({
+            "label": label,
+            "basis": "近 3 年前复权收盘价分位（不含盈利假设）",
+            "price": _r(v, 4),
+            "delta": _r((v / price - 1) * 100, 2) if price else None,
+        })
+    return out, "情景价 = 近 3 年历史价格分位对应的成交密集价位，是区间推演，不是目标价预测；ETF 无 EPS，不使用 PE 情景。"
+
+
+def build_narrative(ctx, kind, price, scores, total, decision, levels, flow_ev, ph):
+    """逐标的生成结论叙述：只陈述本次抓到的数字，不套用比亚迪的模板文案。"""
+    q, ind = ctx["quote"], ctx["ind"]
+    sc = {k: v for k, v in scores.items()}
+    head = (f"截至 {q.get('asof', 'N/A')}，{q.get('name', '')} 报 {fmt(price, 3)} 元，"
+            f"当日 {fmt(q.get('pct'), 2, '%')}；综合评分 {total:+.2f} 分（-100~+100），"
+            f"结论「{decision['signal']}」，风险等级「{levels['risk_level']}」。")
+    dims = "、".join(f"{v['label']} {v['score']:+.1f}" for v in sc.values())
+    bits = [head, f"五维得分：{dims}。"]
+    if kind == "STOCK":
+        vs = ctx["val_stat"]
+        if vs.get("pe_pct") is not None:
+            bits.append(f"PE-TTM {fmt(q.get('pe_ttm'), 2, 'x')} 处于近 {vs['years']} 年 "
+                        f"{vs['pe_pct']:.1f}% 分位（中位数 {fmt(vs.get('pe_med'), 2, 'x')}），"
+                        f"PB 分位 {fmt(vs.get('pb_pct'), 1, '%')}。")
+        sq = ctx["singles"][-1] if ctx.get("singles") else {}
+        if sq.get("np_yoy") is not None:
+            bits.append(f"最新单季（{sq['year']}Q{sq['q']}）归母净利 {fmt(sq['np'] / 1e8, 2)} 亿元、"
+                        f"同比 {sq['np_yoy']:+.2f}%，营收同比 {fmt(sq.get('rev_yoy'), 2, '%')}。")
+    else:
+        bits.append(f"现价处于近 3 年口径价格 {fmt(levels.get('price_pct3'), 1, '%')} 分位"
+                    f"（实际样本 {ph.get('bars')} 根 / 约 {fmt(ph.get('span_years'), 1)} 年，"
+                    f"{ph.get('start')} ~ {ph.get('end')}）、"
+                    f"52 周区间 {fmt(levels.get('pos52'), 1, '%')} 位置，"
+                    f"距 52 周高点 {fmt(levels.get('drawdown_pct'), 1, '%')}，"
+                    f"年化波动率 {fmt(levels.get('vol_annual'), 1, '%')}。")
+        bits.append(f"ETF 无 PE/PB 与财报，估值维度以价格历史分位替代；"
+                    f"近 20 日涨跌 {fmt(q.get('chg_20d'), 2, '%')}，实时量比 {fmt(q.get('volume_ratio'))}。")
+    bits.append(f"主力资金近 5 日净额 {fmt(flow_ev['sum5_yi'], 2, ' 亿元')}、"
+                f"近 20 日 {fmt(flow_ev['sum20_yi'], 2, ' 亿元')}"
+                f"（占同期成交额 {fmt(flow_ev['sum20_pct'], 2, '%')}）；"
+                f"MA20 {fmt(ind.get('ma20'))} / MA60 {fmt(ind.get('ma60'))}，"
+                f"RSI6 {fmt(ind.get('rsi6'), 1)}，MACD 柱 {fmt(ind.get('macd_hist'), 3)}。")
+    if decision["tag"] == "hold":
+        bits.append("当前矛盾是「位置/估值不贵但量价与资金仍在左侧」：右侧确认前不追买，"
+                    "已有仓位按止损纪律持有，空仓者等待站上 MA20 且资金转正。")
+    elif decision["tag"] == "buy":
+        bits.append("多维共振已达标，但仍按条件化触发分批建仓，不在信号日一次性追高。")
+    else:
+        bits.append("趋势与资金同时偏弱，优先控制回撤，收复关键压力位前不逆势加仓。")
+    if decision.get("gated"):
+        bits.append("【闸门】趋势与资金同时转弱或风险等级偏高，买入信号已被强制降级为观望。")
+    if levels.get("risk_reasons"):
+        bits.append("风险成因：" + "；".join(levels["risk_reasons"]) + "。")
+    return "".join(bits)
+
+
+def build_evidence(ctx, kind, price, levels, advice, total, decision, scores):
+    """把 analyze() 的中间结果完整打包，供详情页逐项追溯。"""
+    q, ind, kl = ctx["quote"], ctx["ind"], ctx["kline"]
+    closes = [x["close"] for x in kl]
+    flow = ctx["flow"][-30:]
+    val, fins, bal = ctx["valuation"], ctx["financials"], ctx["balance"]
+    vs = ctx["val_stat"]
+
+    quote = {k: _r(q.get(k)) for k in (
+        "name", "asof", "price", "prev_close", "open", "high", "low", "pct", "change",
+        "amount_wan", "turnover", "volume_ratio", "amplitude", "pe_ttm", "pb",
+        "pe_static", "pe_fwd", "total_mv_yi", "float_mv_yi", "high52", "low52",
+        "chg_5d", "chg_10d", "chg_20d", "chg_60d", "chg_ytd", "avg_price",
+        "limit_up", "limit_down", "volume_lots",
+    )}
+    quote["amount_yi"] = _yi(q.get("amount_wan") and q["amount_wan"] * 1e4)
+
+    if kind == "STOCK":
+        valuation = {
+            "available": bool(val), "years": vs.get("years"), "samples": vs.get("samples"),
+            "pe_ttm": _r(q.get("pe_ttm")), "pe_pct": _r(vs.get("pe_pct"), 2),
+            "pe_pct3": _r(vs.get("pe_pct3"), 2), "pe_med": _r(vs.get("pe_med")),
+            "pe_sd": _r(vs.get("pe_sd")), "pe_min": _r(vs.get("pe_min")),
+            "pe_max": _r(vs.get("pe_max")), "pe_quantiles": engine.clean_json(vs.get("pe_quantiles") or {}),
+            "pb": _r(q.get("pb")), "pb_pct": _r(vs.get("pb_pct"), 2),
+            "pb_med": _r(vs.get("pb_med")), "ps_pct": _r(vs.get("ps_pct"), 2),
+            "peg": _r(vs.get("peg")), "fwd_pe": _r(vs.get("fwd_pe")),
+            "eps_ttm": _r((ctx.get("plan") or {}).get("eps_ttm")),
+            "start": val[0]["date"] if val else None, "end": val[-1]["date"] if val else None,
+            "series": [{"d": x["date"], "pe": _r(x["pe_ttm"], 3), "pb": _r(x["pb"], 3),
+                        "ps": _r(x["ps"], 3)} for x in _sample(val, 320)],
+        }
+    else:
+        valuation = {"available": False, "reason": ETF_NO_FUNDAMENTALS, "series": []}
+
+    technical = {k: _r(v) for k, v in ind.items()}
+    prev = ctx.get("ind_prev") or {}
+    technical["prev"] = {k: _r(prev.get(k)) for k in (
+        "date", "close", "ma20", "ma60", "macd_hist", "rsi6", "k", "d", "j", "boll_mid",
+    )}
+    technical["returns"] = {f"d{n}": _r(_chg(closes, n), 2) for n in (5, 20, 60, 120, 250)}
+    technical["ma_stack"] = ("多头排列" if all(ind.get(a) and ind.get(b) and ind[a] > ind[b]
+                                       for a, b in (("ma5", "ma10"), ("ma10", "ma20"), ("ma20", "ma60")))
+                             else "空头排列" if all(ind.get(a) and ind.get(b) and ind[a] < ind[b]
+                                       for a, b in (("ma5", "ma10"), ("ma10", "ma20"), ("ma20", "ma60")))
+                             else "均线交织")
+
+    bal_last = bal[-1] if bal else {}
+    dr = bal_last.get("debt_ratio")
+    if dr is None and bal_last.get("total_liab") and bal_last.get("total_assets"):
+        dr = bal_last["total_liab"] / bal_last["total_assets"] * 100
+    financials = {
+        "available": bool(fins) and kind == "STOCK",
+        "reason": ETF_NO_FUNDAMENTALS if kind == "ETF" else "财报数据源本次未返回有效记录，相关字段标注 N/A。",
+        "latest": engine.clean_json(fins[-1]) if fins else {},
+        "debt_ratio": _r(dr, 2),
+        "reports": [engine.clean_json(x) for x in fins[-4:]],
+        "quarters": [engine.clean_json(x) for x in ctx["singles"][-8:]],
+        "balance": [engine.clean_json(x) for x in bal[-4:]],
+    }
+
+    cum, acc = [], 0.0
+    for x in flow:
+        acc += x.get("main_net") or 0
+        cum.append(_r(acc / 1e8, 4))
+    amt20 = sum((x.get("amount") or 0) for x in kl[-20:])
+    s5 = sum((x.get("main_net") or 0) for x in flow[-5:])
+    s20 = sum((x.get("main_net") or 0) for x in flow[-20:])
+    flow_ev = {
+        "dates": [x["date"] for x in flow],
+        "main": [_yi(x.get("main_net")) for x in flow],
+        "jumbo": [_yi(x.get("jumbo_net")) for x in flow],
+        "big": [_yi(x.get("big_net")) for x in flow],
+        "mid": [_yi(x.get("mid_net")) for x in flow],
+        "small": [_yi(x.get("small_net")) for x in flow],
+        "cum": cum,
+        "sum5_yi": _r(s5 / 1e8, 4), "sum20_yi": _r(s20 / 1e8, 4),
+        "sum20_pct": _r(s20 / amt20 * 100, 2) if amt20 else None,
+        "start": flow[0]["date"] if flow else None,
+        "end": flow[-1]["date"] if flow else None,
+        "table": [{
+            "d": x["date"], "main": _yi(x.get("main_net")), "jumbo": _yi(x.get("jumbo_net")),
+            "big": _yi(x.get("big_net")), "mid": _yi(x.get("mid_net")),
+            "small": _yi(x.get("small_net")), "pct": _r(x.get("main_pct"), 2),
+            "close": _r(x.get("close")), "chg": _r(x.get("pct"), 2),
+        } for x in reversed(flow[-20:])],
+    }
+
+    seg = [x for x in kl[-750:]]
+    pts = _sample([(x["date"], x["close"]) for x in seg], 240)
+    seg_closes = [x["close"] for x in seg]
+    price_history = {
+        "dates": [p[0] for p in pts], "closes": [_r(p[1], 4) for p in pts],
+        "q25": _r(engine.quantile(seg_closes, 0.25), 4),
+        "q50": _r(engine.quantile(seg_closes, 0.50), 4),
+        "q75": _r(engine.quantile(seg_closes, 0.75), 4),
+        "high": _r(max(seg_closes), 4) if seg_closes else None,
+        "low": _r(min(seg_closes), 4) if seg_closes else None,
+        "pct3": levels.get("price_pct3"),
+        "pct1": _r(pct_rank(closes[-250:], price), 2),
+        "start": seg[0]["date"] if seg else None, "end": seg[-1]["date"] if seg else None,
+        "bars": len(seg), "span_years": _r(len(seg) / 244, 1),
+    }
+
+    scen, basis = build_scenarios(ctx, kind, kl, price)
+    add = ((ctx.get("plan") or {}).get("add") if kind == "STOCK" else
+           f"站稳 MA60（{fmt(levels.get('ma60'), 3)}）且近 5 日主力净额转正 → 加仓 20–30%；"
+           f"突破近 20 日高点 {fmt(levels.get('high20'), 3)} → 再加 20–30%")
+    plan = {
+        "scenarios": scen, "basis": basis,
+        "entry": advice["trigger"], "add": add or "数据不足，暂不给出加仓路径",
+        "stop": advice["stop"], "invalidate": advice["invalidate"],
+        "note": advice["note"],
+    }
+
+    ktable = [{
+        "d": x["date"], "o": x["open"], "h": x["high"], "l": x["low"], "c": x["close"],
+        "v": x.get("volume"), "pct": _r(x.get("pct"), 2),
+        "amt": _r((x.get("amount") or 0) / 1e8, 4), "to": _r(x.get("turnover"), 2),
+    } for x in reversed(kl[-40:])]
+
+    evidence = {
+        "quote": quote, "valuation": valuation, "technical": technical,
+        "financials": financials, "flow": flow_ev, "price_history": price_history,
+        "plan": plan, "ktable": ktable,
+        "quality": {
+            "sources": ctx["sources"], "cross_notes": ctx["cross_notes"],
+            "warnings": ctx["warnings"],
+            "coverage": {
+                "kline": len(kl), "valuation": len(val), "financials": len(fins),
+                "balance": len(bal), "flow": len(ctx["flow"]),
+                "kline_start": kl[0]["date"], "kline_end": kl[-1]["date"],
+            },
+        },
+    }
+    evidence["narrative"] = build_narrative(ctx, kind, price, scores, total,
+                                            decision, levels, flow_ev, price_history)
+    return engine.clean_json(evidence)
+
+
+# ---------------------------------------------------------------------------
 # 单标的完整分析
 # ---------------------------------------------------------------------------
 def analyze_one(item, quiet=True):
@@ -414,6 +684,7 @@ def analyze_one(item, quiet=True):
     tail = kl[-120:]
     all_closes = [x["close"] for x in kl]
     ma20_all, ma60_all = ma_series(all_closes, 20), ma_series(all_closes, 60)
+    evidence = build_evidence(ctx, kind, price, levels, advice, total, decision, scores)
 
     return {
         "symbol": symbol, "name": q.get("name") or alias, "alias": alias,
@@ -439,6 +710,8 @@ def analyze_one(item, quiet=True):
         },
         "warnings": ctx["warnings"],
         "sources": [s["name"] for s in ctx["sources"]],
+        "narrative": evidence["narrative"],
+        "evidence": evidence,
         "ok": True,
     }
 
@@ -569,11 +842,23 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
 footer{margin-top:28px;padding:16px;border:1px solid var(--line);border-radius:10px;
 background:#fff;color:var(--sub);font-size:12px}
 [hidden]{display:none!important}
+.scroll{max-height:430px;overflow:auto;border:1px solid var(--line);border-radius:8px}
+.scroll table{font-size:12px}.scroll th{position:sticky;top:0;z-index:1;background:#f0f3f9}
+.tbl-sm{font-size:12px}.tbl-sm th,.tbl-sm td{padding:6px 8px}
+.chart-mid{height:290px;width:100%}
+.sect{margin-top:18px}.sect h2{margin:0 0 10px;font-size:17px}
+.tagline{display:inline-block;background:#eef2f9;color:#2f5fd0;border-radius:6px;
+padding:2px 8px;font-size:11px;margin-right:6px}
+.hint{background:#f8faff;border-left:3px solid var(--accent);padding:10px 12px;
+border-radius:0 8px 8px 0;font-size:12px;color:#475467;margin:10px 0}
+.warnbox{background:#fffaf0;border-left-color:#e0a22c}
+.narr{font-size:13.5px;line-height:1.85;margin:10px 0 0}
+.kpi .k{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 </style></head><body><div class="wrap">
 <header>
  <div><h1>多标的投研看板</h1>
  <div class="small">数据时点 __ASOF__ ｜ 生成 __TIME__ ｜ 成功 __COUNT__ 个标的（含比亚迪）｜
- 个股沿用比亚迪五维模型，ETF 以价格历史分位替代估值分位</div></div>
+ 每个标的均有七节研报级详情：个股沿用比亚迪五维模型，ETF 以价格历史分位替代估值分位</div></div>
  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
   __BYD_LINK__
   <input id="pfToken" type="password" placeholder="刷新令牌（可选）" autocomplete="off"
@@ -583,7 +868,7 @@ background:#fff;color:var(--sub);font-size:12px}
 </header>
 <nav class="tabs" id="mainTabs">
  <button class="btn on" data-tab="overview">总览（__COUNT__）</button>
- <button class="btn" data-tab="detail">标的详情</button>
+ <button class="btn" data-tab="detail">标的详情（研报级）</button>
  <button class="btn" data-tab="risk">风险与买点清单</button>
  <button class="btn" data-tab="method">口径与来源</button>
 </nav>
@@ -620,6 +905,15 @@ background:#fff;color:var(--sub);font-size:12px}
  <div class="box"><b>ETF（__ETF_COUNT__ 只）</b>：ETF 无 PE/PB 与财报，改用
  价格位置 25%（近 3 年收盘价分位 + 52 周区间 + 回撤）、趋势技术 30%、
  波动回撤 20%、资金情绪 15%（主力净额 / 同期成交额）、短期动量 10%。</div>
+ <div class="box"><b>每个标的的研报级详情（七节，深度一致）</b>：① 五维评分逐项打分依据与雷达；
+ ② 估值 / 价格位置与历史分位带；③ K 线图 + 近 40 日精确表 + 技术指标全表 + 多周期涨跌；
+ ④ 最新财报、单季拆分、资产负债（ETF 改为替代依据清单与特有风险）；⑤ 近 20 日逐日资金分档与累计；
+ ⑥ 风险点位、条件化交易计划与情景区间；⑦ 数据源接口、双源交叉校验与本次抓数覆盖。
+ 个股与 ETF 使用同一展示深度，不因标的类型而省略分析依据；ETF 无 PE/PB/财报时明确标注原因，不填 0、不编造数值。</div>
+ <div class="box warn"><b>情景推演的局限</b>：个股情景价 = 历史 PE 分位 × 当前 EPS(TTM)。
+ 若最新单季净利同比大幅跳升、当前 PE 处于历史极低分位，历史 PE 中枢对应的是旧盈利水平，
+ 直接套用会显著放大价格；页面会对 |相对现价| &gt; 150% 的行标注「极端推演」，
+ 并同时给出近 3 年价格分位作为交叉锚。所有情景均为历史区间推演，不是目标价预测。</div>
  <div class="box warn"><b>两道闸门</b>：① <b>趋势闸门</b>（沿用比亚迪）——
  趋势分与资金分同时 &lt; −20 时，即使总分达标也把「买入」降级为观望；
  ② <b>风险闸门</b>（本看板新增）——风险等级为「高」且趋势分 &lt; 0 时，
@@ -692,7 +986,82 @@ function svgChart(s, el) {
     '" fill="' + c + '"/>';
   let g = '<rect x="0" y="0" width="' + W + '" height="' + H + '" fill="#fff"/>';
 
-  if (s.type === 'hbar') {
+  if (s.type === 'lines') {
+    const ss = (s.series || []).filter(x => x.values && x.values.length);
+    const nums = [];
+    ss.forEach(x => x.values.forEach(v => {
+      if (v !== null && v !== undefined && isFinite(Number(v))) nums.push(Number(v));
+    }));
+    (s.marks || []).forEach(m => { if (isFinite(Number(m.value))) nums.push(Number(m.value)); });
+    let hi = Math.max(...(nums.length ? nums : [1])), lo = Math.min(...(nums.length ? nums : [0]));
+    if (hi <= lo) hi = lo + 1;
+    const pad = (hi - lo) * 0.08; hi += pad; lo -= pad;
+    let maxN = 1; ss.forEach(x => maxN = Math.max(maxN, x.values.length));
+    const X = i => L + iw * (i / Math.max(1, maxN - 1));
+    const Y = v => T + ih * (1 - (Number(v) - lo) / (hi - lo));
+    for (let k = 0; k <= 4; k++) {
+      const yy = T + ih * k / 4;
+      g += LN(L, yy, W - R, yy, '#eef1f6');
+      g += T2(L - 6, yy + 3, n(hi - (hi - lo) * k / 4, 1), 9, 'end');
+    }
+    (s.marks || []).forEach(m => {
+      const yy = Y(m.value), c = m.color || GREY;
+      g += LN(L, yy, W - R, yy, c, 1.1) + T2(W - R - 3, yy - 4, m.label, 9, 'end', c);
+    });
+    ss.forEach((se, si) => {
+      const pts = [];
+      se.values.forEach((v, i) => {
+        if (v !== null && v !== undefined && isFinite(Number(v)))
+          pts.push(X(i).toFixed(1) + ',' + Y(v).toFixed(1));
+      });
+      const c = se.color || BLUE;
+      if (pts.length > 1) g += '<polyline points="' + pts.join(' ') +
+        '" fill="none" stroke="' + c + '" stroke-width="1.7"/>';
+      g += T2(L + si * 96, T - 6, se.name, 10, 'start', c);
+    });
+    const lab = s.labels || [];
+    for (let k = 0; k < 6; k++) {
+      const i = Math.round(k * (lab.length - 1) / 5);
+      if (lab.length) g += T2(X(i), H - 10, String(lab[i] || '').slice(5), 9, 'middle');
+    }
+  } else if (s.type === 'combo') {
+    const bs = s.bars || [], ln = s.line || null, N = Math.max(1, (s.labels || []).length);
+    const step = iw / N, bw = Math.max(1, Math.min(18, step * 0.72 / Math.max(1, bs.length)));
+    const av = [];
+    bs.forEach(b => b.values.forEach(v => { if (isFinite(Number(v))) av.push(Math.abs(Number(v))); }));
+    const m = Math.max(...(av.length ? av : [1]), 0.0001) * 1.15;
+    const zy = T + ih / 2, half = ih / 2 * 0.9;
+    g += LN(L, zy, W - R, zy, '#c9d2e0', 1.2);
+    bs.forEach((b, bi) => b.values.forEach((v, i) => {
+      const val = Number(v) || 0, h = Math.abs(val) / m * half;
+      const x = L + (i + 0.5) * step + (bi - (bs.length - 1) / 2) * bw;
+      g += RC(x - bw / 2, val >= 0 ? zy - h : zy, bw, h,
+              b.color || (val >= 0 ? RED : GREEN), 1);
+    }));
+    if (ln && ln.values && ln.values.length) {
+      const lv = ln.values.filter(v => v !== null && v !== undefined && isFinite(Number(v))).map(Number);
+      if (lv.length) {
+        let lhi = Math.max(...lv), llo = Math.min(...lv);
+        if (lhi <= llo) lhi = llo + 1;
+        const LY = v => T + ih * (1 - (Number(v) - llo) / (lhi - llo));
+        const pts = [];
+        ln.values.forEach((v, i) => {
+          if (v !== null && v !== undefined && isFinite(Number(v)))
+            pts.push((L + (i + 0.5) * step).toFixed(1) + ',' + LY(v).toFixed(1));
+        });
+        if (pts.length > 1) g += '<polyline points="' + pts.join(' ') +
+          '" fill="none" stroke="' + (ln.color || BLUE) + '" stroke-width="1.8"/>';
+        g += T2(L, T - 6, ln.name + '（右轴示意）', 10, 'start', ln.color || BLUE);
+      }
+    }
+    const lab = s.labels || [];
+    for (let k = 0; k < 6; k++) {
+      const i = Math.round(k * (lab.length - 1) / Math.max(1, 5));
+      if (lab.length) g += T2(L + (i + 0.5) * step, H - 10, String(lab[i] || '').slice(5), 9, 'middle');
+    }
+    g += T2(L - 6, T + 10, n(m, 1), 9, 'end') + T2(L - 6, zy - 4, '0', 9, 'end') +
+         T2(L - 6, T + ih, n(-m, 1), 9, 'end');
+  } else if (s.type === 'hbar') {
     const v = s.values.map(Number);
     const m = Math.max(20, ...v.map(x => Math.abs(x))) * 1.12;
     const zx = L + iw / 2, sc = (iw / 2) / m, row = ih / Math.max(1, v.length);
@@ -856,75 +1225,374 @@ function drawRisk() {
 
 let current = ITEMS.length ? ITEMS[0].symbol : '';
 
+function vOr(v, d, suf) {
+  return (v === null || v === undefined || v === '' || !isFinite(Number(v)))
+    ? 'N/A' : Number(v).toFixed(d === undefined ? 2 : d) + (suf || '');
+}
+function mkTable(heads, rows, cls) {
+  return '<table class="' + (cls || '') + '"><thead><tr>' +
+    heads.map(h => '<th>' + h + '</th>').join('') + '</tr></thead><tbody>' +
+    rows.join('') + '</tbody></table>';
+}
+function tr(cells, numCols) {
+  return '<tr>' + cells.map((c, i) =>
+    '<td' + (numCols && numCols.indexOf(i) >= 0 ? ' class="num"' : '') + '>' + c + '</td>').join('') + '</tr>';
+}
+function yi(v, d) {
+  return (v === null || v === undefined || !isFinite(Number(v))) ? 'N/A' : n(Number(v) / 1e8, d === undefined ? 2 : d);
+}
+function sign(v, d, suf) {
+  if (v === null || v === undefined || !isFinite(Number(v))) return 'N/A';
+  return (Number(v) > 0 ? '+' : '') + Number(v).toFixed(d === undefined ? 2 : d) + (suf || '');
+}
+
 function drawDetail() {
   const r = byCode(current); if (!r) return;
   document.querySelectorAll('#chips .chip').forEach(c => c.classList.toggle('on', c.dataset.code === current));
-  const L = r.levels, A = r.advice, C = r.chart;
-  const scoreRows = Object.values(r.scores).map(s => `
-    <tr><td><b>${esc(s.label)}</b> <span class="small">×${n(s.weight*100,0)}%</span></td>
-    <td class="num ${cls(s.score)}"><b>${n(s.score,1)}</b></td>
-    <td class="num">${n(s.weighted,1)}</td>
-    <td class="small">${s.detail.map(esc).join('<br>')}</td></tr>`).join('');
-  $('detail').innerHTML = `
-   <div class="card" style="margin-top:14px">
-    <div class="hero">
-      <div><div class="small">${esc(r.name)}（${r.symbol}） · ${esc(r.kind)} · ${esc(r.sector)}</div>
-        <div style="font-size:30px;font-weight:700" class="${cls(r.pct)}">${n(r.price,3)}
-          <span style="font-size:16px">${Number(r.pct)>0?'+':''}${n(r.pct,2)}%</span></div>
-        <div class="small">数据时点 ${esc(r.asof)} ｜ ${esc(r.model)}</div></div>
-      <div><div class="small">综合评分（±100）</div><div class="score ${cls(r.total)}">${n(r.total,1)}</div></div>
-      <div><span class="badge ${tagCls(r.tag)}">${esc(r.signal)}</span>
-        <div class="small" style="margin-top:8px">风险等级
-          <b class="${riskCls(r.risk_level)}">${esc(r.risk_level)}</b></div>
-        ${r.gated?'<div class="small">闸门已触发：买入降级为观望（等右侧确认）</div>':''}</div>
-    </div>
-    <div class="kpis">
-      <div class="kpi"><div class="k">PE-TTM / 价格分位</div><div class="v">${r.pe_ttm?n(r.pe_ttm,2)+'x':n(L.price_pct3,1)+'%'}</div></div>
-      <div class="kpi"><div class="k">PB</div><div class="v">${r.pb?n(r.pb,2)+'x':'N/A'}</div></div>
-      <div class="kpi"><div class="k">52周区间位置</div><div class="v">${n(L.pos52,1)}%</div></div>
-      <div class="kpi"><div class="k">距52周高点</div><div class="v down">${n(L.drawdown_pct,1)}%</div></div>
-      <div class="kpi"><div class="k">年化波动率</div><div class="v">${n(L.vol_annual,1)}%</div></div>
-      <div class="kpi"><div class="k">近250日最大回撤</div><div class="v">${n(L.max_drawdown_pct,1)}%</div></div>
-      <div class="kpi"><div class="k">MA20 / MA60</div><div class="v" style="font-size:14px">${n(L.ma20,3)} / ${n(L.ma60,3)}</div></div>
-      <div class="kpi"><div class="k">ATR / 现价</div><div class="v">${n(L.atr_pct,2)}%</div></div>
-    </div>
-   </div>
-   <div class="card" style="margin-top:14px"><h2 style="margin-top:0">风险点位</h2>
-    <div class="two">
-      <div><table><thead><tr><th>项目</th><th class="num">数值</th><th>说明</th></tr></thead><tbody>
-        <tr><td>最近支撑</td><td class="num"><b>${n(L.support,3)}</b></td><td class="small">MA20 / 近20日低点 / 布林下轨 中最近者</td></tr>
-        <tr><td>次级支撑</td><td class="num">${n(L.support2,3)}</td><td class="small">近 250 日最低（前复权）</td></tr>
-        <tr><td>最近压力</td><td class="num"><b>${n(L.resistance,3)}</b></td><td class="small">MA60 / 近20日高点 / 布林上轨 中最近者</td></tr>
-        <tr><td>次级压力</td><td class="num">${n(L.resistance2,3)}</td><td class="small">近 250 日最高（前复权）</td></tr>
-        <tr><td>参考止损</td><td class="num up"><b>${n(L.stop,3)}</b></td><td class="small">支撑下方 1.5% 与现价 −8% 取近者</td></tr>
-      </tbody></table></div>
-      <div><h3>风险成因</h3><div class="box warn">${L.risk_reasons.map(esc).join('<br>')}</div>
-        <h3>逻辑失效条件</h3><div class="box">${esc(A.invalidate)}</div></div>
-    </div>
-   </div>
-   <div class="card" style="margin-top:14px"><h2 style="margin-top:0">买入建议（条件化）</h2>
-    <div class="box"><b>${esc(A.action)}</b><br>${esc(A.trigger)}<br>
-      <span class="small">仓位：${esc(A.position)}</span></div>
-    <div class="box warn"><b>止损纪律</b><br>${esc(A.stop)}</div>
-    <p class="small">${esc(A.note)}</p>
-   </div>
-   <div class="card" style="margin-top:14px"><h2 style="margin-top:0">K 线 / 均线 / 成交量</h2>
-     <div id="chartK" class="chart"></div>
-     <p class="small">前复权日 K，最近 120 个交易日。A 股习惯：红涨绿跌。</p></div>
-   <div class="two" style="margin-top:14px">
-     <div class="card"><h2 style="margin-top:0">五维评分</h2><div id="chartRadar" class="chart-sm"></div></div>
-     <div class="card"><h2 style="margin-top:0">主力资金流（近30日 / 亿元）</h2><div id="chartFlow" class="chart-sm"></div></div>
-   </div>
-   <div class="card" style="margin-top:14px"><h2 style="margin-top:0">评分明细（逐项留痕）</h2>
-     <table><thead><tr><th>维度</th><th class="num">得分</th><th class="num">加权</th><th>依据</th></tr></thead>
-     <tbody>${scoreRows}</tbody></table>
-     ${r.warnings.length?'<div class="box warn"><b>数据缺口</b><br>'+r.warnings.map(esc).join('<br>')+'</div>':''}
-   </div>`;
+  if (!r.evidence) {
+    $('detail').innerHTML = '<div class="card" style="margin-top:14px"><h2 style="margin-top:0">' +
+      esc(r.alias) + '（' + r.symbol + '）</h2><div class="box warn">该标的来自旧版缓存，尚未包含研报级证据包。' +
+      '请点击页面右上角「立即刷新数据」重新抓取（或运行 python portfolio.py --once），' +
+      '刷新完成后即可看到与比亚迪同等级的完整分析依据。</div>' +
+      '<div class="kpis"><div class="kpi"><div class="k">综合评分</div><div class="v">' + n(r.total,1) +
+      '</div></div><div class="kpi"><div class="k">信号</div><div class="v">' + esc(r.signal) +
+      '</div></div><div class="kpi"><div class="k">风险</div><div class="v">' + esc(r.risk_level) +
+      '</div></div></div></div>';
+    return;
+  }
+  const E = r.evidence, Q = E.quote || {}, V = E.valuation || {}, T = E.technical || {},
+        F = E.financials || {}, FL = E.flow || {}, PH = E.price_history || {},
+        PL = E.plan || {}, QU = E.quality || {};
+  const L = r.levels, A = r.advice, C = r.chart, stock = r.kind === 'STOCK';
+  const kpiPairs = stock ? [
+    ['最新价', vOr(r.price,3,' 元')], ['当日涨跌', sign(r.pct,2,'%')],
+    ['PE-TTM', vOr(V.pe_ttm,2,'x')], ['PE 历史分位', vOr(V.pe_pct,1,'%')],
+    ['PB / 分位', vOr(V.pb,2,'x') + ' / ' + vOr(V.pb_pct,1,'%')],
+    ['总市值', vOr(Q.total_mv_yi,0,' 亿')], ['成交额', vOr(Q.amount_yi,2,' 亿')],
+    ['换手率 / 量比', vOr(Q.turnover,2,'%') + ' / ' + vOr(Q.volume_ratio,2)],
+    ['52 周区间位置', vOr(L.pos52,1,'%')], ['年化波动率', vOr(L.vol_annual,1,'%')]
+  ] : [
+    ['最新价', vOr(r.price,3,' 元')], ['当日涨跌', sign(r.pct,2,'%')],
+    ['近 3 年价格分位', vOr(PH.pct3,1,'%')], ['近 1 年价格分位', vOr(PH.pct1,1,'%')],
+    ['52 周区间位置', vOr(L.pos52,1,'%')], ['距 52 周高点', vOr(L.drawdown_pct,1,'%')],
+    ['年化波动率', vOr(L.vol_annual,1,'%')], ['成交额', vOr(Q.amount_yi,2,' 亿')],
+    ['换手率 / 量比', vOr(Q.turnover,2,'%') + ' / ' + vOr(Q.volume_ratio,2)],
+    ['近 250 日最大回撤', vOr(L.max_drawdown_pct,1,'%')]
+  ];
+  const kpiHtml = kpiPairs.map(x =>
+    '<div class="kpi"><div class="k">' + x[0] + '</div><div class="v">' + x[1] + '</div></div>').join('');
+
+  // 一、评分模型明细
+  const scoreRows = Object.values(r.scores).map(s =>
+    tr(['<b>' + esc(s.label) + '</b> <span class="small">×' + n(s.weight*100,0) + '%</span>',
+        '<b class="' + cls(s.score) + '">' + sign(s.score,1) + '</b>',
+        sign(s.weighted,1), '<span class="small">' + s.detail.map(esc).join('<br>') + '</span>'], [1,2])).join('');
+  const sec1 = '<div class="card sect"><h2>一、评分模型明细（' + esc(r.model) + '）</h2>' +
+    '<div class="two"><div>' + mkTable(['维度','原始分','加权分','打分依据（逐项可追溯）'],
+      [scoreRows, tr(['<b>合计</b>','—','<b class="' + cls(r.total) + '">' + sign(r.total,2) + '</b>',
+        '<span class="small">评分 ∈ [-100,+100]：≥35 买入，15~35 偏买入，−15~15 观望，−35~−15 减仓，≤−35 卖出</span>'], [1,2])]) +
+      '<div class="hint">趋势闸门：趋势技术分 &lt; −20 且资金情绪分 &lt; −20 时，即使综合分达标也强制降级为观望；' +
+      '风险闸门：风险等级「高」且趋势分 &lt; 0 时同样不允许输出买入。本次是否触发：<b>' +
+      (r.gated ? '是' : '否') + '</b>。</div></div>' +
+      '<div><h3>五维评分雷达</h3><div id="chartRadar" class="chart-mid"></div></div></div></div>';
+
+  // 二、估值位置 / 价格位置
+  let sec2 = '';
+  if (stock) {
+    const vq = V.pe_quantiles || {};
+    const vr = [
+      tr(['当前 PE-TTM', vOr(V.pe_ttm,2,'x'), '腾讯行情 + 东财 push2 双源一致口径']),
+      tr(['近 ' + vOr(V.years,0) + ' 年分位', vOr(V.pe_pct,1,'%'), '样本 ' + vOr(V.samples,0) + ' 个交易日']),
+      tr(['近 3 年分位', vOr(V.pe_pct3,1,'%'), '短周期敏感性校验']),
+      tr(['历史中位数', vOr(V.pe_med,2,'x'), '估值中枢']),
+      tr(['历史区间', vOr(V.pe_min,2,'x') + ' ~ ' + vOr(V.pe_max,2,'x'), '最小 ~ 最大']),
+      tr(['25% / 50% / 75% 分位', vOr(vq.q25,2,'x') + ' / ' + vOr(vq.q50,2,'x') + ' / ' + vOr(vq.q75,2,'x'), '情景推演基准']),
+      tr(['PB / PB 分位', vOr(V.pb,2,'x') + ' / ' + vOr(V.pb_pct,1,'%'), 'PB 中位数 ' + vOr(V.pb_med,2,'x')]),
+      tr(['PS-TTM 分位', vOr(V.ps_pct,1,'%'), '市销率历史位置']),
+      tr(['PEG', vOr(V.peg,2), '净利同比为负时不适用']),
+      tr(['前瞻 PE', vOr(V.fwd_pe,2,'x'), '需自填分析师 EPS 预测，程序不编造']),
+      tr(['EPS(TTM)', vOr(V.eps_ttm,3,' 元'), '现价 ÷ PE-TTM 反推']),
+      tr(['历史区间起止', esc(V.start || 'N/A') + ' ~ ' + esc(V.end || 'N/A'), '东财 datacenter RPT_VALUEANALYSIS_DET'])
+    ].join('');
+    sec2 = '<div class="card sect"><h2>二、估值位置（PE / PB / PS 历史分位）</h2><div class="two">' +
+      '<div>' + mkTable(['指标','数值','说明'], [vr]) + '</div>' +
+      '<div><h3>PE-TTM 历史带（虚线为 25% / 50% / 75% 分位）</h3>' +
+      '<div id="chartVal" class="chart-mid"></div>' +
+      '<p class="small">前复权收盘价与每日 PE-TTM，同源东财 datacenter；虚线为历史分位，最后一列为当前值。</p></div></div>' +
+      '<div class="hint">价格位置交叉锚：现价处于近 3 年口径价格 <b>' + vOr(PH.pct3,1,'%') +
+      '</b> 分位（实际样本 ' + vOr(PH.bars,0) + ' 根 / 约 ' + vOr(PH.span_years,1) + ' 年，' +
+      esc(PH.start||'N/A') + ' ~ ' + esc(PH.end||'N/A') + '）；25% / 50% / 75% 分位价 ' +
+      vOr(PH.q25,3) + ' / ' + vOr(PH.q50,3) + ' / ' + vOr(PH.q75,3) + ' 元。' +
+      'PE 分位与价格分位互为校验，避免单一估值口径误导。</div></div>';
+  } else {
+    const pr = [
+      tr(['近 3 年口径价格分位', vOr(PH.pct3,1,'%'), '替代个股 PE 分位，越低越有利']),
+      tr(['近 1 年（250 日）分位', vOr(PH.pct1,1,'%'), '短周期位置校验']),
+      tr(['52 周区间位置', vOr(L.pos52,1,'%'), '（现价 − 52 周低）/（高 − 低）']),
+      tr(['52 周高 / 低', vOr(L.high52,3) + ' / ' + vOr(L.low52,3), '前复权日 K 近 250 日']),
+      tr(['近 3 年高 / 低', vOr(PH.high,3) + ' / ' + vOr(PH.low,3), '实际样本 ' + vOr(PH.bars,0) + ' 根']),
+      tr(['25% / 50% / 75% 分位价', vOr(PH.q25,3) + ' / ' + vOr(PH.q50,3) + ' / ' + vOr(PH.q75,3), '历史成交密集价位']),
+      tr(['距 52 周高点', vOr(L.drawdown_pct,1,'%'), '回撤深度']),
+      tr(['近 250 日最大回撤', vOr(L.max_drawdown_pct,1,'%'), '峰值到谷底']),
+      tr(['年化波动率 / ATR 占比', vOr(L.vol_annual,1,'%') + ' / ' + vOr(L.atr_pct,2,'%'), '近 60 日 / ATR14']),
+      tr(['区间涨跌 5/20/60/120/250 日',
+          [5,20,60,120,250].map(k => sign(T.returns && T.returns['d'+k],1,'%')).join(' / '), '由前复权日 K 自算'])
+    ].join('');
+    sec2 = '<div class="card sect"><h2>二、价格位置（替代估值分位）</h2><div class="two">' +
+      '<div>' + mkTable(['指标','数值','说明'], [pr]) + '</div>' +
+      '<div><h3>近 3 年价格带（虚线为 25% / 50% / 75% 分位）</h3>' +
+      '<div id="chartVal" class="chart-mid"></div>' +
+      '<p class="small">前复权日 K 收盘价，' + esc(PH.start||'N/A') + ' ~ ' + esc(PH.end||'N/A') +
+      '，共 ' + vOr(PH.bars,0) + ' 根（约 ' + vOr(PH.span_years,1) + ' 年）。</p></div></div>' +
+      '<div class="hint warnbox"><b>为什么没有 PE / PB / 财报？</b><br>' + esc(V.reason || '') + '</div></div>';
+  }
+
+  // 三、价格走势与技术面
+  const klRows = (E.ktable || []).map(x =>
+    tr([esc(x.d), vOr(x.o,3), vOr(x.h,3), vOr(x.l,3), vOr(x.c,3),
+        vOr(x.v,0), sign(x.pct,2,'%'), vOr(x.amt,2), vOr(x.to,2,'%')])).join('');
+  const tRows = [
+    tr(['MA5 / MA10 / MA20', [5,10,20].map(k => vOr(T['ma'+k],3)).join(' / '),
+        'MA60 / MA120 / MA250', [60,120,250].map(k => vOr(T['ma'+k],3)).join(' / ')]),
+    tr(['均线形态', '<b>' + esc(T.ma_stack || 'N/A') + '</b>',
+        'MACD 柱 / DIF / DEA', [T.macd_hist,T.dif,T.dea].map(x=>vOr(x,3)).join(' / ')]),
+    tr(['前一日 MACD 柱', vOr(T.prev && T.prev.macd_hist,3),
+        'RSI6 / RSI12 / RSI24', [T.rsi6,T.rsi12,T.rsi24].map(x=>vOr(x,1)).join(' / ')]),
+    tr(['KDJ  K / D / J', [T.k,T.d,T.j].map(x=>vOr(x,1)).join(' / '),
+        'BOLL 上 / 中 / 下', [T.boll_upper,T.boll_mid,T.boll_lower].map(x=>vOr(x,3)).join(' / ')]),
+    tr(['近 20 日高 / 低', vOr(T.high20,3) + ' / ' + vOr(T.low20,3),
+        '近 60 日高 / 低', vOr(T.high60,3) + ' / ' + vOr(T.low60,3)]),
+    tr(['ATR14 / 年化波动率', vOr(T.atr14,3) + ' / ' + vOr(T.volatility_annual,1,'%'),
+        '量比（自算 / 行情商）', vOr(T.vol_ratio_calc,2) + ' / ' + vOr(Q.volume_ratio,2)]),
+    tr(['最新量 / 5 日均量', vOr(T.vol_ma5,0) + ' 手（5 日均）',
+        'OBV / 前一日', vOr(T.obv,0) + ' / ' + vOr(T.obv_prev,0)]),
+    tr(['52 周高 / 低', vOr(Q.high52,3) + ' / ' + vOr(Q.low52,3),
+        '当日振幅 / 均价', vOr(Q.amplitude,2,'%') + ' / ' + vOr(Q.avg_price,3)])
+  ].join('');
+  const ret = T.returns || {};
+  const retRows = [5,20,60,120,250].map(k =>
+    tr(['近 ' + k + ' 个交易日', '<b class="' + cls(ret['d'+k]) + '">' + sign(ret['d'+k],2,'%') + '</b>',
+        '由前复权日 K 收盘价自算（非行情商字段）'])).join('');
+  const sec3 = '<div class="card sect"><h2>三、价格走势与技术面</h2>' +
+    '<div style="margin-bottom:10px"><button class="btn on" id="btnChart" onclick="toggleK(true)">图</button> ' +
+    '<button class="btn" id="btnTable" onclick="toggleK(false)">表（近 40 日精确值）</button>' +
+    '<span class="small" style="margin-left:10px">「图 / 表」只切换本节的 K 线与成交量；精确数值不依赖图表</span></div>' +
+    '<div id="k_chart"><div id="chartK" class="chart"></div></div>' +
+    '<div id="k_table" style="display:none"><div class="scroll">' +
+    mkTable(['日期','开盘','最高','最低','收盘','成交量(手)','涨跌','成交额(亿)','换手'], [klRows], 'tbl-sm') +
+    '</div></div>' +
+    '<p class="small">前复权日 K，最近 ' + vOr(C.dates.length,0) + ' 个交易日；最新交易日 ' +
+    esc((C.dates||[]).slice(-1)[0] || 'N/A') + '。A 股习惯：红涨绿跌。图表库同源内嵌，断网也能显示。</p></div>' +
+    '<div class="card sect"><div class="two"><div><h3>技术指标全表</h3>' +
+    mkTable(['指标','数值','指标','数值'], [tRows], 'tbl-sm') + '</div>' +
+    '<div><h3>区间涨跌（自算）</h3>' + mkTable(['周期','涨跌幅','口径'], [retRows], 'tbl-sm') +
+    '<div class="hint">指标全部由本地前复权日 K 计算，多指标交叉验证，单一超卖信号不作为买入依据。</div></div></div></div>';
+
+  // 四、财务与业绩拐点 / ETF 替代依据
+  let sec4 = '';
+  if (stock && F.available) {
+    const f = F.latest || {}, b = (F.balance || []).slice(-1)[0] || {};
+    const fr = [
+      tr(['最新报告期', esc(f.date || 'N/A')]), tr(['披露日', esc(f.notice || 'N/A')]),
+      tr(['累计营业收入', yi(f.revenue,2) + ' 亿元']), tr(['累计归母净利润', yi(f.net_profit,2) + ' 亿元']),
+      tr(['营收同比', sign(f.rev_yoy,2,'%')]), tr(['归母净利同比', sign(f.np_yoy,2,'%')]),
+      tr(['毛利率', vOr(f.gross_margin,2,'%')]), tr(['加权 ROE', vOr(f.roe,2,'%')]),
+      tr(['基本 EPS', vOr(f.eps,3,' 元')]), tr(['每股经营现金流', vOr(f.ocf_ps,3,' 元')]),
+      tr(['每股净资产 BPS', vOr(f.bps,3,' 元')]), tr(['资产负债率', vOr(F.debt_ratio,2,'%')])
+    ].join('');
+    const br = [
+      tr(['报告期', esc(b.date || 'N/A')]), tr(['总资产', yi(b.total_assets,1) + ' 亿元']),
+      tr(['总负债', yi(b.total_liab,1) + ' 亿元']), tr(['存货', yi(b.inventory,1) + ' 亿元']),
+      tr(['货币资金', yi(b.cash,1) + ' 亿元']), tr(['应收账款', yi(b.receivable,1) + ' 亿元'])
+    ].join('');
+    const qs = F.quarters || [];
+    const qr = qs.map(x => tr([esc(String(x.year) + 'Q' + String(x.q) + '（' + esc(x.date||'') + '）'),
+      yi(x.rev,2), yi(x.np,2), sign(x.rev_yoy,1,'%'),
+      '<b class="' + cls(x.np_yoy) + '">' + sign(x.np_yoy,1,'%') + '</b>',
+      vOr(x.margin,2,'%')], [1,2,3,4,5])).join('');
+    const rep = (F.reports || []).map(x => tr([esc(x.date||''), yi(x.revenue,2), yi(x.net_profit,2),
+      sign(x.rev_yoy,1,'%'), sign(x.np_yoy,1,'%'), vOr(x.roe,2,'%')], [1,2,3,4,5])).join('');
+    sec4 = '<div class="card sect"><h2>四、财务与业绩拐点</h2><div class="two">' +
+      '<div><h3>最新财报（累计口径）</h3>' + mkTable(['项目','数值'], [fr], 'tbl-sm') + '</div>' +
+      '<div><h3>资产负债与风险项</h3>' + mkTable(['项目','数值'], [br], 'tbl-sm') +
+      '<p class="small">字段缺失时以资产 / 负债反推，或直接标注 N/A，不做估算填充。</p></div></div>' +
+      '<h3>单季拆分（累计值差分，用于识别同比拐点）</h3><div class="scroll">' +
+      mkTable(['单季','营收(亿)','归母净利(亿)','营收同比','净利同比','当季毛利率'], [qr], 'tbl-sm') + '</div>' +
+      '<div id="' + 'chartGrowth" class="chart-mid"></div>' +
+      '<h3>近 4 期累计口径（对照）</h3>' +
+      mkTable(['报告期','累计营收(亿)','累计净利(亿)','营收同比','净利同比','ROE'], [rep], 'tbl-sm') +
+      '<p class="small">来源：东财 datacenter RPT_LICO_FN_CPD / RPT_DMSK_FN_BALANCE（原始披露为公司定期报告，非一手原文）；' +
+      '单季值由「本期累计 − 上期累计」差分并与去年同季比对，含会计调整，正式决策请核对公告原文。</p></div>';
+  } else {
+    const alt = [
+      tr(['近 3 年价格分位', vOr(PH.pct3,1,'%'), '替代 PE 分位，权重 25%（价格位置维）']),
+      tr(['近 250 日最大回撤', vOr(L.max_drawdown_pct,1,'%'), '波动回撤维，权重 20%']),
+      tr(['年化波动率 / ATR 占比', vOr(L.vol_annual,1,'%') + ' / ' + vOr(L.atr_pct,2,'%'), '波动回撤维']),
+      tr(['近 20 日主力净额占成交额', vOr(FL.sum20_pct,2,'%'), '资金情绪维，权重 15%']),
+      tr(['最新量 / 5 日均量', vOr(T.vol_ratio_calc,2), '资金情绪 + 短期动量']),
+      tr(['RSI6 / KDJ-J / 近 20 日涨跌', vOr(T.rsi6,1) + ' / ' + vOr(T.j,1) + ' / ' + sign(Q.chg_20d,2,'%'), '短期动量维，权重 10%']),
+      tr(['MA20 / MA60 / 均线形态', vOr(T.ma20,3) + ' / ' + vOr(T.ma60,3) + ' / ' + esc(T.ma_stack||''), '趋势技术维，权重 30%']),
+      tr(['成交额 / 换手率', vOr(Q.amount_yi,2,' 亿') + ' / ' + vOr(Q.turnover,2,'%'), '流动性观察（不单独打分）'])
+    ].join('');
+    sec4 = '<div class="card sect"><h2>四、' +
+      (stock ? '财务数据缺口与替代依据' : 'ETF 的替代分析依据（不套用个股财报模型）') + '</h2>' +
+      '<div class="hint warnbox"><b>口径说明</b><br>' + esc(F.reason || V.reason || '') + '</div>' +
+      '<div class="two"><div><h3>本页实际使用的量化依据</h3>' +
+      mkTable(['证据项','数值','在模型中的作用'], [alt], 'tbl-sm') + '</div>' +
+      '<div><h3>历史价格下的替代「估值带」</h3><div id="chartGrowth" class="chart-mid"></div>' +
+      '<p class="small">柱为近 5 / 20 / 60 / 120 / 250 交易日区间涨跌，用于判断 ETF 所处周期位置，' +
+      '不引入任何未经核实的基金净值 / 折溢价估算。</p></div></div>' +
+      '<div class="hint">' + (stock
+        ? '<b>数据缺口处理</b>：本次财报未取到，成长质量与风险维度中依赖财务的打分项按 N/A 处理、不计入评分；'
+          + '下方给出价格 / 量能 / 资金维度的替代证据，请核对公司定期报告后再做判断。'
+        : '<b>ETF 特有风险（方法论提示，非本页数值）</b>：跟踪误差、二级市场折溢价、'
+          + '成份股集中与行业景气、申赎流动性与规模变化、跨境 / 商品标的的汇率与隔夜跳空。'
+          + '这些风险需结合基金定期报告与交易所申赎清单判断，本页不给出未核实的估算值。') + '</div></div>';
+  }
+
+  // 五、资金情绪
+  const flRows = (FL.table || []).map(x => tr([esc(x.d),
+    '<b class="' + cls(x.main) + '">' + sign(x.main,3) + '</b>', sign(x.jumbo,3),
+    sign(x.big,3), sign(x.mid,3), sign(x.small,3),
+    sign(x.pct,2,'%'), vOr(x.close,3), sign(x.chg,2,'%')], [1,2,3,4,5,6,7,8])).join('');
+  const sec5 = '<div class="card sect"><h2>五、资金情绪（主力 = 超大单 + 大单）</h2>' +
+    '<div class="kpis">' +
+    '<div class="kpi"><div class="k">近 5 日主力净额</div><div class="v ' + cls(FL.sum5_yi) + '">' + sign(FL.sum5_yi,2,' 亿') + '</div></div>' +
+    '<div class="kpi"><div class="k">近 20 日主力净额</div><div class="v ' + cls(FL.sum20_yi) + '">' + sign(FL.sum20_yi,2,' 亿') + '</div></div>' +
+    '<div class="kpi"><div class="k">20 日净额 / 同期成交额</div><div class="v ' + cls(FL.sum20_pct) + '">' + sign(FL.sum20_pct,2,'%') + '</div></div>' +
+    '<div class="kpi"><div class="k">区间</div><div class="v" style="font-size:14px">' + esc(FL.start||'N/A') + ' ~ ' + esc(FL.end||'N/A') + '</div></div></div>' +
+    '<div id="chartFlow" class="chart-mid"></div>' +
+    '<h3>逐日资金流（近 20 交易日，单位亿元）</h3><div class="scroll">' +
+    mkTable(['日期','主力净额','超大单','大单','中单','小单','主力占比','收盘','当日涨跌'], [flRows], 'tbl-sm') +
+    '</div><p class="small">来源：东财 push2his fflow/daykline；分档口径由接口返回，累计线为区间主力净额累加。</p></div>';
+
+  // 六、风险点位与条件化交易计划
+  const lvRows = [
+    tr(['最近支撑', '<b>' + vOr(L.support,3) + '</b>', 'MA20 / 近 20 日低点 / 布林下轨 中最近者']),
+    tr(['次级支撑', vOr(L.support2,3), '近 250 日最低（前复权）']),
+    tr(['最近压力', '<b>' + vOr(L.resistance,3) + '</b>', 'MA60 / 近 20 日高点 / 布林上轨 中最近者']),
+    tr(['次级压力', vOr(L.resistance2,3), '近 250 日最高（前复权）']),
+    tr(['参考止损', '<b class="up">' + vOr(L.stop,3) + '</b>', '支撑下方 1.5% 与现价 −8% 取近者']),
+    tr(['近 20 日高 / 低', vOr(L.high20,3) + ' / ' + vOr(L.low20,3), '短期箱体']),
+    tr(['ATR / 现价', vOr(L.atr_pct,2,'%'), '单日波动参考'])
+  ].join('');
+  const scen = PL.scenarios || [];
+  const scenRows = scen.map(x => tr([esc(x.label), esc(x.basis), vOr(x.price,3),
+    '<b class="' + cls(x.delta) + '">' + sign(x.delta,2,'%') + '</b>' +
+    (Math.abs(Number(x.delta)||0) > 150 ? ' <span class="small">⚠️ 极端推演</span>' : '')], [2,3])).join('') ||
+    tr(['历史样本不足，不生成情景区间','—','—','—']);
+  const sec6 = '<div class="card sect"><h2>六、风险点位与条件化交易计划</h2><div class="two">' +
+    '<div>' + mkTable(['项目','数值','说明'], [lvRows], 'tbl-sm') + '</div>' +
+    '<div><h3>风险成因</h3><div class="box warn">' + (L.risk_reasons||[]).map(esc).join('<br>') + '</div>' +
+    '<h3>逻辑失效条件</h3><div class="box">' + esc(A.invalidate) + '</div>' +
+    '<div class="hint">风险等级 <b class="' + riskCls(r.risk_level) + '">' + esc(r.risk_level) +
+    '</b>；' + (r.gated ? '本次闸门已触发，买入信号降级为观望。' : '本次未触发闸门。') + '</div></div></div>' +
+    '<h3>动作路径（条件化，不是当日买卖指令）</h3>' +
+    '<div class="box"><b>入场：</b>' + esc(PL.entry || A.trigger) + '<br><b>加仓：</b>' + esc(PL.add || '—') +
+    '<br><b>止损：</b>' + esc(PL.stop || A.stop) + '<br><b>失效：</b>' + esc(PL.invalidate || A.invalidate) +
+    '<br><span class="small">仓位：' + esc(A.position) + '</span></div>' +
+    '<h3>情景区间（' + (stock ? 'PE 分位推演' : '价格分位推演') + '，非目标价预测）</h3>' +
+    mkTable(['情景','推算依据','对应价格','相对现价'], [scenRows], 'tbl-sm') +
+    '<div class="hint ' + (/⚠/.test(PL.note || '') ? 'warnbox' : '') + '">' + esc(PL.note || '') + '</div>' +
+    '<p class="small">未提供个人资金量、持仓成本、税费与风险承受度，故不给出具体仓位金额；' +
+    '适用前提为平衡型风险偏好、3–12 个月持有周期、A 股境内交易。</p></div>';
+
+  // 七、数据来源与口径校验
+  const srcRows = (QU.sources || []).map(x =>
+    tr([esc(x.name), '<span class="small">' + esc(x.url) + '</span>', esc(x.time)])).join('');
+  const cov = QU.coverage || {};
+  const sec7 = '<div class="card sect"><h2>七、数据来源与口径校验</h2>' +
+    mkTable(['数据源','接口','数据时点 / 抓取时间'], [srcRows], 'tbl-sm') +
+    '<div class="two" style="margin-top:12px"><div><h3>双源交叉校验</h3><ul class="small">' +
+    (QU.cross_notes || []).map(x => '<li>' + esc(x) + '</li>').join('') + '</ul>' +
+    '<h3>数据缺口与告警</h3><ul class="small">' +
+    ((QU.warnings || []).length ? (QU.warnings||[]).map(x => '<li>' + esc(x) + '</li>').join('') : '<li>无</li>') +
+    '</ul></div><div><h3>本次抓数覆盖</h3>' +
+    mkTable(['数据集','样本量'], [
+      tr(['前复权日 K', vOr(cov.kline,0) + ' 根（' + esc(cov.kline_start||'') + ' ~ ' + esc(cov.kline_end||'') + '）']),
+      tr(['历史每日估值', vOr(cov.valuation,0) + ' 条' + (stock ? '' : '（ETF 不适用）')]),
+      tr(['季度财报', vOr(cov.financials,0) + ' 期' + (stock ? '' : '（ETF 不适用）')]),
+      tr(['资产负债表', vOr(cov.balance,0) + ' 期']),
+      tr(['每日资金流', vOr(cov.flow,0) + ' 日'])
+    ], 'tbl-sm') +
+    '<div class="hint">所有数值运行时抓取，未取到的字段统一显示 N/A 且不计入评分，不做估算填充；' +
+    '行情商与第三方数据平台属非一手来源，正式决策前请核对交易所公告与基金 / 公司定期报告原文。</div>' +
+    '</div></div><p class="small">' + esc(P.disclaimer || '') + '</p></div>';
+
+  $('detail').innerHTML =
+    '<div class="card" style="margin-top:14px"><div class="hero">' +
+      '<div><div class="small">' + esc(r.name) + '（' + r.symbol + '） · ' + esc(r.kind) +
+      ' · ' + esc(r.sector) + '</div><div style="font-size:30px;font-weight:700" class="' + cls(r.pct) + '">' +
+      vOr(r.price,3) + ' <span style="font-size:16px">' + sign(r.pct,2,'%') + '</span></div>' +
+      '<div class="small">数据时点 ' + esc(r.asof) + ' ｜ ' + esc(r.model) + '</div></div>' +
+      '<div><div class="small">综合评分（±100）</div><div class="score ' + cls(r.total) + '">' + sign(r.total,1) + '</div></div>' +
+      '<div><span class="badge ' + tagCls(r.tag) + '">' + esc(r.signal) + '</span>' +
+      '<div class="small" style="margin-top:8px">风险等级 <b class="' + riskCls(r.risk_level) + '">' +
+      esc(r.risk_level) + '</b></div>' +
+      (r.gated ? '<div class="small">闸门已触发：买入降级为观望</div>' : '') + '</div></div>' +
+      '<div class="kpis">' + kpiHtml + '</div>' +
+      '<h3 style="margin-top:14px">结论与依据摘要</h3><p class="narr">' + esc(r.narrative || '') + '</p></div>' +
+    sec1 + sec2 + sec3 + sec4 + sec5 + sec6 + sec7;
   drawCharts(r);
 }
 
-function drawCharts(r){
-  const C = r.chart;
+function toggleK(show) {
+  const a = $('k_chart'), b = $('k_table'), bc = $('btnChart'), bt = $('btnTable');
+  if (!a || !b || !bc || !bt) return;
+  a.style.display = show ? 'block' : 'none';
+  b.style.display = show ? 'none' : 'block';
+  bc.className = show ? 'btn on' : 'btn';
+  bt.className = show ? 'btn' : 'btn on';
+  if (show && charts['chartK']) setTimeout(() => charts['chartK'].resize(), 20);
+}
+
+function drawCharts(r) {
+  const E = r.evidence, Q = E.quote || {}, V = E.valuation || {}, T = E.technical || {},
+        F = E.financials || {}, FL = E.flow || {}, PH = E.price_history || {}, C = r.chart;
+  const stock = r.kind === 'STOCK';
+
+  // 1. 五维雷达
+  const sc = Object.values(r.scores);
+  chart('chartRadar', {
+    animation:false, tooltip:{},
+    radar:{indicator:sc.map(s=>({name:s.label,min:-100,max:100})),radius:'64%',
+      axisName:{fontSize:11,color:'#475467'},splitLine:{lineStyle:{color:'#e4e8ef'}},
+      splitArea:{areaStyle:{color:['#fbfcfe','#f4f7fc']}}},
+    series:[{type:'radar',data:[{value:sc.map(s=>s.score),name:'评分',
+      areaStyle:{color:'rgba(47,95,208,.18)'},lineStyle:{color:'#2f5fd0',width:2},
+      itemStyle:{color:'#2f5fd0'}}]}]
+  }, {type:'radar', labels:sc.map(s=>s.label), values:sc.map(s=>s.score)});
+
+  // 2. 估值带（个股）/ 价格带（ETF）
+  const vq = V.pe_quantiles || {};
+  const valDates = stock ? (V.series||[]).map(x=>x.d) : (PH.dates||[]);
+  const valVals = stock ? (V.series||[]).map(x=>x.pe) : (PH.closes||[]);
+  const marks = (stock ? [
+    {name:'25%', yAxis:vq.q25, lineStyle:{color:'#2e9e6b',type:'dashed'}},
+    {name:'50%', yAxis:vq.q50, lineStyle:{color:'#8a6d3b',type:'dashed'}},
+    {name:'75%', yAxis:vq.q75, lineStyle:{color:'#d64545',type:'dashed'}},
+    {name:'当前', yAxis:V.pe_ttm, lineStyle:{color:'#2f5fd0'}}
+  ] : [
+    {name:'25%', yAxis:PH.q25, lineStyle:{color:'#2e9e6b',type:'dashed'}},
+    {name:'50%', yAxis:PH.q50, lineStyle:{color:'#8a6d3b',type:'dashed'}},
+    {name:'75%', yAxis:PH.q75, lineStyle:{color:'#d64545',type:'dashed'}},
+    {name:'现价', yAxis:r.price, lineStyle:{color:'#2f5fd0'}}
+  ]).filter(m => m.yAxis !== null && m.yAxis !== undefined && isFinite(Number(m.yAxis)));
+  const specVal = {type:'lines', labels:valDates,
+    series:[{name:stock?'PE-TTM':'收盘价', values:valVals, color:'#2f5fd0'}],
+    marks: marks.map(m=>({value:m.yAxis,label:m.name,color:m.lineStyle.color}))};
+  chart('chartVal', {
+    animation:false, tooltip:{trigger:'axis'},
+    grid:{left:58,right:22,top:24,bottom:40},
+    xAxis:{type:'category',data:valDates,axisLabel:{fontSize:9,color:'#667085'},boundaryGap:false},
+    yAxis:{type:'value',scale:true,name:stock?'PE-TTM(倍)':'价格(元)',
+      splitLine:{lineStyle:{color:'#eef1f6'}},axisLabel:{fontSize:10}},
+    series:[{name:stock?'PE-TTM':'收盘价',type:'line',data:valVals,showSymbol:false,
+      lineStyle:{width:1.7,color:'#2f5fd0'},areaStyle:{color:'rgba(47,95,208,.08)'},
+      markLine:{silent:true,symbol:'none',label:{formatter:'{b}',fontSize:10},data:marks}}]
+  }, specVal);
+
+  // 3. K 线 + 成交量
   chart('chartK', {
     animation:false,
     tooltip:{trigger:'axis',axisPointer:{type:'cross'}},
@@ -943,26 +1611,57 @@ function drawCharts(r){
        itemStyle:{color:(p)=>C.ohlc[p.dataIndex][1]>=C.ohlc[p.dataIndex][0]?'#d64545':'#2e9e6b'}}
     ]
   }, {type:'kline', dates:C.dates, ohlc:C.ohlc, vols:C.vols, ma20:C.ma20, ma60:C.ma60});
-  const sc = Object.values(r.scores);
-  chart('chartRadar', {
-    animation:false,
-    tooltip:{},
-    radar:{indicator:sc.map(s=>({name:s.label,min:-100,max:100})),radius:'64%',
-      axisName:{fontSize:11,color:'#475467'},splitLine:{lineStyle:{color:'#e4e8ef'}},
-      splitArea:{areaStyle:{color:['#fbfcfe','#f4f7fc']}}},
-    series:[{type:'radar',data:[{value:sc.map(s=>s.score),name:'评分',
-      areaStyle:{color:'rgba(47,95,208,.18)'},lineStyle:{color:'#2f5fd0',width:2},
-      itemStyle:{color:'#2f5fd0'}}]}]
-  }, {type:'radar', labels:sc.map(s=>s.label), values:sc.map(s=>s.score)});
+
+  // 4. 单季趋势（个股）/ 区间涨跌（ETF）
+  if (stock && (F.quarters||[]).length) {
+    const qs = F.quarters || [];
+    chart('chartGrowth', {
+      animation:false, tooltip:{trigger:'axis'},
+      legend:{data:['单季营收','单季归母净利','净利同比'],top:0,textStyle:{fontSize:10}},
+      grid:{left:56,right:52,top:30,bottom:34},
+      xAxis:{type:'category',data:qs.map(x=>String(x.year)+'Q'+String(x.q)),axisLabel:{fontSize:10}},
+      yAxis:[{name:'亿元',splitLine:{lineStyle:{color:'#eef1f6'}}},{name:'同比%'}],
+      series:[
+        {name:'单季营收',type:'bar',data:qs.map(x=>Number(x.rev)/1e8),itemStyle:{color:'#9db7de'}},
+        {name:'单季归母净利',type:'bar',data:qs.map(x=>Number(x.np)/1e8),itemStyle:{color:'#2f5fd0'}},
+        {name:'净利同比',type:'line',yAxisIndex:1,data:qs.map(x=>x.np_yoy),
+         showSymbol:true,lineStyle:{width:2,color:'#d64545'}}
+      ]
+    }, {type:'combo', labels:qs.map(x=>String(x.year)+'Q'+String(x.q)),
+        bars:[{name:'营收',values:qs.map(x=>Number(x.rev)/1e8),color:'#9db7de'},
+              {name:'净利',values:qs.map(x=>Number(x.np)/1e8),color:'#2f5fd0'}],
+        line:{name:'净利同比',values:qs.map(x=>x.np_yoy),color:'#d64545'}});
+  } else {
+    const ks = [5,20,60,120,250], rt = T.returns || {};
+    const vals = ks.map(k=>Number(rt['d'+k])||0);
+    chart('chartGrowth', {
+      animation:false, tooltip:{trigger:'axis'},
+      grid:{left:52,right:18,top:24,bottom:34},
+      xAxis:{type:'category',data:ks.map(k=>k+'日'),axisLabel:{fontSize:10}},
+      yAxis:{type:'value',name:'涨跌%',splitLine:{lineStyle:{color:'#eef1f6'}}},
+      series:[{type:'bar',data:vals.map(v=>({value:v,itemStyle:{color:v>=0?'#d64545':'#2e9e6b'}})),
+        barWidth:'52%',label:{show:true,position:'top',formatter:(p)=>n(p.value,1)+'%',fontSize:10}}]
+    }, {type:'bars', labels:ks.map(k=>k+'日'), values:vals});
+  }
+
+  // 5. 资金流：当日柱 + 累计线
+  const fd = FL.dates || [], fm = FL.main || [], fc = FL.cum || [];
   chart('chartFlow', {
-    animation:false,
-    tooltip:{trigger:'axis'},
-    grid:{left:52,right:16,top:16,bottom:46},
-    xAxis:{type:'category',data:C.flowDates,axisLabel:{fontSize:9,rotate:45,color:'#667085'}},
-    yAxis:{type:'value',splitLine:{lineStyle:{color:'#eef1f6'}},axisLabel:{fontSize:10}},
-    series:[{type:'bar',data:C.flowMain.map(v=>({value:v,
-      itemStyle:{color:v>=0?'#d64545':'#2e9e6b'}})),barWidth:'62%'}]
-  }, {type:'bars', labels:C.flowDates, values:C.flowMain});
+    animation:false, tooltip:{trigger:'axis'},
+    legend:{data:['当日主力净额','累计净额'],top:0,textStyle:{fontSize:10}},
+    grid:{left:54,right:54,top:30,bottom:44},
+    xAxis:{type:'category',data:fd,axisLabel:{fontSize:9,rotate:45,color:'#667085'}},
+    yAxis:[{type:'value',name:'当日(亿)',splitLine:{lineStyle:{color:'#eef1f6'}}},
+           {type:'value',name:'累计(亿)'}],
+    series:[
+      {name:'当日主力净额',type:'bar',data:fm.map(v=>({value:v,
+        itemStyle:{color:v>=0?'#d64545':'#2e9e6b'}})),barWidth:'60%'},
+      {name:'累计净额',type:'line',yAxisIndex:1,data:fc,smooth:true,showSymbol:false,
+        lineStyle:{width:2,color:'#2f5fd0'}}
+    ]
+  }, {type:'combo', labels:fd,
+      bars:[{name:'主力',values:fm,color:'#2f5fd0'}],
+      line:{name:'累计',values:fc,color:'#e0952f'}});
 }
 
 function selectSymbol(code){ current = code; $('symbolSelect').value = code; drawDetail(); }

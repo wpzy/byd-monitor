@@ -413,8 +413,8 @@ ul{margin:8px 0;padding-left:20px}
 </head>
 <body><div class="wrap">
 <h1>__TITLE__</h1>
-<div style="margin:0 0 12px"><a href="/portfolio" style="display:inline-block;padding:7px 14px;border:1px solid #2f5fd0;border-radius:8px;background:#2f5fd0;color:#fff;text-decoration:none;font-size:13px">→ 多标的投研看板（17 个标的，含比亚迪）</a>
-<span class="small" style="margin-left:10px">横向对比 · 风险点位 · 条件化买入建议</span></div>
+<div style="margin:0 0 12px"><a href="/portfolio" style="display:inline-block;padding:7px 14px;border:1px solid #2f5fd0;border-radius:8px;background:#2f5fd0;color:#fff;text-decoration:none;font-size:13px">→ 多标的投研看板（17 个标的 · 每个都有研报级详情）</a>
+<span class="small" style="margin-left:10px">横向对比 · 七节依据 · 风险点位 · 条件化买入建议</span></div>
 <div class="meta small" style="margin-bottom:14px">__NAME__（__CODE__.SZ，A 股 / 人民币）｜ 数据时点 __ASOF__ ｜ __STATE__ ｜ 页面生成 __GEN__</div>
 
 <div class="topbar">
