@@ -38,6 +38,11 @@ ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 REPORT_DIR = ROOT / "report"
 PORTFOLIO_JSON = DATA_DIR / "portfolio.json"
+# 最近一次「完整成功」的备份、最近一次失败诊断、随仓库分发的内置离线快照。
+# 云服务器首次部署 / 数据源临时不可达时，页面至少能显示一份标注清楚的旧数据。
+LAST_GOOD_JSON = DATA_DIR / "portfolio_last_good.json"
+REFRESH_ERROR_JSON = DATA_DIR / "portfolio_errors.json"
+SEED_JSON = ROOT / "deploy" / "seed" / "portfolio-snapshot.json"
 
 # symbol, market, kind, 简称, 板块
 UNIVERSE = [
@@ -630,7 +635,8 @@ def analyze_one(item, quiet=True):
             ctx[name] = fn(*args)
         except Exception as e:      # noqa: BLE001
             ctx[name] = []
-            ctx["warnings"].append(f"{name} 数据源失败（{type(e).__name__}），相关维度标注 N/A")
+            ctx["warnings"].append(
+                f"{name} 数据源失败（{type(e).__name__}: {str(e)[:240]}），相关维度标注 N/A")
     ctx["sources"] = ds.sources
 
     kl = ctx["kline"]
@@ -716,7 +722,33 @@ def analyze_one(item, quiet=True):
     }
 
 
+def _read_json(path):
+    try:
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _write_json(path, obj):
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(engine.clean_json(obj), ensure_ascii=False),
+                        encoding="utf-8")
+        return True
+    except (OSError, ValueError, TypeError) as e:
+        print(f"[warn] 写入 {path.name} 失败：{e}", file=sys.stderr)
+        return False
+
+
 def run_all(workers=5, quiet=True):
+    """抓取全部标的。
+
+    关键保护：数据源整体不可达时，绝不把「0 个标的」写进主缓存。
+    否则一次失败刷新就会把上一份完整数据冲掉，页面直接变成空壳
+    （百度云服务器上曾出现：17/17 报「有效 K 线不足（0 根）」）。
+    """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     results, errors = [], []
     t0 = time.time()
@@ -737,26 +769,86 @@ def run_all(workers=5, quiet=True):
                     print(f"  {item[0]} {item[3]:<12} FAILED {type(e).__name__}: {e}")
     order = {item[0]: i for i, item in enumerate(UNIVERSE)}
     results.sort(key=lambda r: order.get(r["symbol"], 999))
-    data = {
+    fresh = {
         "generated_at": f"{engine.now_cn():%Y-%m-%d %H:%M:%S}",
         "asof": max((r["asof"] for r in results if r.get("asof")), default=None),
         "count": len(results), "failed": len(errors),
         "workers": workers, "elapsed": round(time.time() - t0, 1),
-        "disclaimer": DISCLAIMER,
+        "disclaimer": DISCLAIMER, "refresh_ok": True,
         "items": results, "errors": errors,
     }
-    PORTFOLIO_JSON.write_text(json.dumps(engine.clean_json(data), ensure_ascii=False),
-                              encoding="utf-8")
-    return data
+    min_ok = max(1, math.ceil(len(UNIVERSE) * 0.5))
+    if len(results) >= min_ok:
+        if _write_json(PORTFOLIO_JSON, fresh):
+            _write_json(LAST_GOOD_JSON, fresh)      # 保留一份完整成功快照
+        try:
+            REFRESH_ERROR_JSON.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return fresh
+
+    # ---- 抓取大面积失败：只落诊断，保留已有数据 ----
+    diag = {
+        "generated_at": fresh["generated_at"], "total": len(UNIVERSE),
+        "success": len(results), "failed": len(errors), "errors": errors,
+        "hint": "行情/日K 数据源不可达。程序已启用腾讯日K回退；若仍失败，"
+                "请访问 /api/diagnostics 逐源探测，确认出站网络后点击「立即刷新数据」。",
+    }
+    _write_json(REFRESH_ERROR_JSON, diag)
+    main = _read_json(PORTFOLIO_JSON)
+    base, origin, seed = None, "", False
+    if main and main.get("items") and main.get("count", 0) > 0:
+        base, origin = main, "上次成功缓存"
+    for path, label, is_seed in ((LAST_GOOD_JSON, "上次成功备份", False),
+                                 (SEED_JSON, "内置离线快照", True)):
+        if base:
+            break
+        d = _read_json(path)
+        if d and d.get("items"):
+            base, origin, seed = d, label, is_seed
+    if not quiet:
+        print(f"[warn] 仅 {len(results)}/{len(UNIVERSE)} 个标的抓取成功，"
+              f"已放弃写入主缓存；{'回退 ' + origin if base else '无可用回退数据'}")
+    if base:
+        stale = dict(base)
+        stale.update({
+            "stale": True, "seed": seed, "refresh_ok": False,
+            "fallback_source": origin, "count": len(base["items"]),
+            "last_attempt_at": fresh["generated_at"],
+            "refresh_failed": len(errors), "refresh_errors": errors,
+            "refresh_hint": diag["hint"],
+        })
+        return stale
+    # 确实没有任何历史/内置数据，才写空主文件；页面会显示明确的失败面板
+    fresh.update({"refresh_ok": False, "stale": True, "fallback_source": "无",
+                  "refresh_failed": len(errors), "refresh_hint": diag["hint"]})
+    _write_json(PORTFOLIO_JSON, fresh)
+    return fresh
 
 
 def load_cached():
-    if PORTFOLIO_JSON.exists():
-        try:
-            return json.loads(PORTFOLIO_JSON.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            pass
-    return None
+    """主缓存无效时，依次回退「上次成功备份」与随仓库分发的内置离线快照。"""
+    main = _read_json(PORTFOLIO_JSON)
+    if main and main.get("items") and main.get("count", 0) > 0:
+        return main
+    for path, origin, is_seed in ((LAST_GOOD_JSON, "上次成功备份", False),
+                                  (SEED_JSON, "内置离线快照", True)):
+        d = _read_json(path)
+        if not (d and d.get("items")):
+            continue
+        out = dict(d)
+        out.update({
+            "stale": True, "seed": is_seed, "fallback_source": origin,
+            "count": len(d["items"]),
+            "refresh_hint": (main or {}).get("refresh_hint")
+                            or "实时抓取尚未成功，请点击「立即刷新数据」重试。",
+        })
+        if main:
+            out["refresh_errors"] = main.get("errors") or []
+            out["last_attempt_at"] = main.get("generated_at")
+            out["refresh_failed"] = main.get("failed")
+        return out
+    return main
 
 
 def print_summary(data):
@@ -764,6 +856,11 @@ def print_summary(data):
     print(f"  多标的投研汇总 | 数据时点 {data.get('asof')} | 生成 {data.get('generated_at')} "
           f"| 成功 {data['count']}/{data['count']+data['failed']}")
     print("=" * 108)
+    if data.get("stale"):
+        print(f"  注意：最近一次刷新失败（{data.get('refresh_failed', '?')} 个标的），"
+              f"当前展示{data.get('fallback_source', '旧数据')}，非实时数据。")
+        print(f"  {data.get('refresh_hint', '')}")
+        print("=" * 108)
     print(f"{'代码':<8}{'名称':<14}{'类型':<7}{'现价':>10}{'涨跌%':>9}{'评分':>9}"
           f"{'信号':<18}{'风险':<5}{'支撑':>10}{'压力':>10}{'止损':>10}{'回撤%':>9}")
     print("-" * 108)
@@ -854,6 +951,12 @@ border-radius:0 8px 8px 0;font-size:12px;color:#475467;margin:10px 0}
 .warnbox{background:#fffaf0;border-left-color:#e0a22c}
 .narr{font-size:13.5px;line-height:1.85;margin:10px 0 0}
 .kpi .k{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.alert{margin:0 0 14px;padding:12px 16px;border-radius:10px;border:1px solid #edd9a6;
+background:#fffaf0;color:#7a5a12;font-size:13px;line-height:1.8}
+.alert.err{border-color:#e9b6b6;background:#fff5f5;color:#8c2f2f}
+.alert code{background:#f3f4f8;padding:1px 6px;border-radius:4px;font-size:12px}
+.alert ul{margin:6px 0 0;padding-left:20px}
+.empty{padding:28px 20px;text-align:center;color:#667085;font-size:13px;line-height:2}
 </style></head><body><div class="wrap">
 <header>
  <div><h1>多标的投研看板</h1>
@@ -866,6 +969,7 @@ border-radius:0 8px 8px 0;font-size:12px;color:#475467;margin:10px 0}
   <button class="btn" id="btnRefresh" onclick="refresh()">立即刷新数据</button>
   <span class="small" id="refreshMsg"></span></div>
 </header>
+__ALERT__
 <nav class="tabs" id="mainTabs">
  <button class="btn on" data-tab="overview">总览（__COUNT__）</button>
  <button class="btn" data-tab="detail">标的详情（研报级）</button>
@@ -919,9 +1023,15 @@ border-radius:0 8px 8px 0;font-size:12px;color:#475467;margin:10px 0}
  ② <b>风险闸门</b>（本看板新增）——风险等级为「高」且趋势分 &lt; 0 时，
  同样不允许输出买入，避免在空头排列 + 高波动 + 深度回撤的位置逆势建仓。
  被降级后仍会给出条件化买点、仓位与止损，只是信号标记为「观望（等右侧确认）」。</div>
- <h3>数据源</h3><p class="small">腾讯行情（实时报价 / PE / PB / 52 周高低）、
+ <h3>数据源与可用性</h3><p class="small">腾讯行情（实时报价 / PE / PB / 52 周高低）、
  东方财富 push2（交叉校验）、push2his（前复权日 K、每日主力资金流）、
  datacenter（个股历史每日 PE/PB/PS、季度财报、资产负债表）。所有数值运行时抓取，代码不内置行情数字。</p>
+ <div class="box warn"><b>日 K 多源回退与失败保护</b>：日 K 依次尝试东财 HTTPS → 东财 HTTP → 东财备用节点 →
+ 腾讯 fqkline（前复权）→ 腾讯 kline（不复权），实际使用来源写入每个标的第七节的数据源表；
+ 腾讯回退仅含 OHLCV，成交额 / 换手率标 N/A 而不编造，ETF 走不复权口径时额外告警。
+ 若某次刷新成功标的数量不足半数，程序保留上一份完整数据、只落失败诊断，绝不把空结果覆盖到页面；
+ 主缓存缺失时回退到随仓库分发的内置离线快照，并在页面顶部显著标注「非实时」。
+ 服务端 <code>/api/diagnostics</code> 可从服务器自身网络逐源探测连通性。</div>
  <h3>数据时点</h3><p class="small">__ASOF__；周末与节假日沿用最近交易日收盘数据，页面明确标注。</p>
  </div>
 </section>
@@ -1177,6 +1287,15 @@ function showTab(name) {
 }
 
 function drawOverview() {
+  if (!ITEMS.length) {
+    const c = $('chartOverview');
+    if (c) c.innerHTML = '<div class="empty"><b>暂无综合评分排序图</b><br>' +
+      '本次抓取没有成功标的，图表与标的卡片会在刷新成功后自动出现。<br>' +
+      '页面顶部已列出失败原因、数据源诊断入口与重试步骤。</div>';
+    if ($('tiles')) $('tiles').innerHTML = '<div class="card empty">暂无标的卡片。' +
+      '请点击右上角「立即刷新数据」，或访问 <code>/api/diagnostics</code> 检查数据源连通性。</div>';
+    return;
+  }
   const sorted = ITEMS.slice().sort((a,b) => b.total - a.total);
   chart('chartOverview', {
     animation:false,
@@ -1247,7 +1366,13 @@ function sign(v, d, suf) {
 }
 
 function drawDetail() {
-  const r = byCode(current); if (!r) return;
+  const r = byCode(current);
+  if (!r) {
+    $('detail').innerHTML = '<div class="card" style="margin-top:14px"><div class="empty">' +
+      '<b>暂无标的详情</b><br>本次抓取没有成功标的，研报级详情会在刷新成功后自动出现。' +
+      '<br>详见页面顶部的失败原因与 <code>/api/diagnostics</code> 排查指引。</div></div>';
+    return;
+  }
   document.querySelectorAll('#chips .chip').forEach(c => c.classList.toggle('on', c.dataset.code === current));
   if (!r.evidence) {
     $('detail').innerHTML = '<div class="card" style="margin-top:14px"><h2 style="margin-top:0">' +
@@ -1666,19 +1791,41 @@ function drawCharts(r) {
 
 function selectSymbol(code){ current = code; $('symbolSelect').value = code; drawDetail(); }
 
+async function pollRefresh(){
+  // 后台抓数结束后自动刷新页面，避免用户以为「点了没反应」
+  let tries = 0;
+  const timer = setInterval(async () => {
+    tries++;
+    try {
+      const r = await fetch('/api/portfolio/status', {cache:'no-store'});
+      const s = await r.json();
+      if ((!s.refreshing && tries >= 2) || tries > 60) {
+        clearInterval(timer); location.reload();
+      }
+    } catch (e) { if (tries > 60) clearInterval(timer); }
+  }, 3000);
+}
+
 async function refresh(){
   const btn = $('btnRefresh'); const msg = $('refreshMsg');
   btn.disabled = true; msg.textContent = ' 正在后台抓取，请稍候…';
+  let started = false;
   try {
     const tok = $('pfToken') ? $('pfToken').value.trim() : '';
     const headers = tok ? {'X-Refresh-Token': tok} : {};
     const r = await fetch('/api/portfolio/refresh', {method:'POST', headers:headers});
     const j = await r.json();
     if (r.status === 401) { msg.textContent = ' 刷新令牌无效，请在输入框填写 REFRESH_TOKEN'; }
-    else { msg.textContent = j.started ? ' 已启动，约 1 分钟后刷新页面' :
-           (j.message || ' 已有刷新任务在运行'); }
+    else if (j.started) {
+      started = true;
+      msg.textContent = ' 已启动，抓取完成后页面会自动刷新…';
+    } else { msg.textContent = j.message || ' 已有刷新任务在运行'; }
   } catch(e) { msg.textContent = ' 刷新接口不可用（独立 HTML 模式请重跑脚本）'; }
-  finally { btn.disabled = false; setTimeout(()=>msg.textContent='',8000); }
+  finally {
+    btn.disabled = false;
+    if (started) pollRefresh();
+    else setTimeout(()=>msg.textContent='',8000);
+  }
 }
 
 function init(){
@@ -1697,7 +1844,44 @@ init();
 </script></body></html>"""
 
 
+def _alert_html(data):
+    """把「刷新失败 / 正在用旧数据」直接写在页面顶部，避免用户只看到空坐标轴。"""
+    esc = html_mod.escape
+    items = data.get("items") or []
+    if not items:
+        errs = data.get("refresh_errors") or data.get("errors") or []
+        rows = "".join(
+            "<li>" + esc(f"{e.get('symbol', '?')} {e.get('alias', '')}") + "：" +
+            esc(str(e.get("error", ""))[:160]) + "</li>" for e in errs[:6])
+        return (
+            '<div class="alert err"><b>暂时没有可展示的标的数据</b><br>'
+            f'最近一次抓取（{esc(str(data.get("generated_at") or "N/A"))}）没有成功标的，'
+            '最常见原因是服务器到行情数据源的 HTTPS 出站被限流或拦截，导致日 K 全为空。'
+            '<br>排查步骤：① 打开 <code>/api/diagnostics</code> 查看每个数据源的连通性；'
+            '② 确认云主机安全组与防火墙允许 HTTPS 出站、DNS 正常；'
+            '③ 点击右上角「立即刷新数据」重试（新版已内置腾讯日 K 回退与离线快照）。'
+            + ("<ul>" + rows + "</ul>" if rows else "") + "</div>")
+    if data.get("stale"):
+        src = esc(str(data.get("fallback_source") or "旧数据"))
+        hint = esc(str(data.get("refresh_hint") or ""))
+        return (
+            '<div class="alert"><b>当前展示的不是实时数据</b><br>'
+            f'数据来源：{src}；数据时点 {esc(str(data.get("asof") or "N/A"))}；'
+            f'快照生成于 {esc(str(data.get("generated_at") or "N/A"))}；'
+            f'最近一次刷新 {esc(str(data.get("last_attempt_at") or "N/A"))} '
+            f'失败 {esc(str(data.get("refresh_failed") or "?"))} 个标的。'
+            f'<br>{hint} 可打开 <code>/api/diagnostics</code> 逐源排查；'
+            '点击右上角「立即刷新数据」重试，抓取成功后本提示会自动消失。</div>')
+    return ""
+
+
 def render_page(data, standalone=False):
+    data = dict(data or {})
+    data.setdefault("items", [])
+    data.setdefault("count", len(data["items"]))
+    data.setdefault("generated_at", f"{engine.now_cn():%Y-%m-%d %H:%M:%S}")
+    data.setdefault("asof", None)
+    data.setdefault("errors", [])
     echarts = engine.echarts_script_tag() if standalone else \
         '<script src="/static/echarts.min.js"></script>'
     if standalone:
@@ -1716,6 +1900,7 @@ def render_page(data, standalone=False):
         "__COUNT__": str(data["count"]),
         "__ETF_COUNT__": str(etf), "__STOCK_COUNT__": str(stock),
         "__DISC__": html_mod.escape(DISCLAIMER),
+        "__ALERT__": _alert_html(data),
         "__ECHARTS__": echarts,
         "__BYD_LINK__": byd_link,
         "__DATA__": json.dumps(engine.clean_json(data), ensure_ascii=False, allow_nan=False),

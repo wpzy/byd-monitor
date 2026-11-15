@@ -25,12 +25,13 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 import traceback
 from datetime import timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 import byd_monitor as engine
 
@@ -236,7 +237,7 @@ pf_lock = threading.Lock()
 PF = {
     "refreshing": False, "last_run_at": None, "last_error": None,
     "last_trigger": None, "run_count": 0, "generated_at": None, "count": 0,
-    "last_success_date": None,
+    "last_success_date": None, "last_failed_ts": 0.0,
 }
 
 
@@ -249,12 +250,23 @@ def portfolio_refresh(trigger="manual"):
     log(f"多标的看板开始刷新（{trigger}）：{len(pf.UNIVERSE)} 个标的")
     try:
         d = pf.run_all(workers=PORTFOLIO_WORKERS, quiet=True)
-        PF.update({"last_error": None, "run_count": PF["run_count"] + 1,
-                   "generated_at": d["generated_at"], "count": d["count"],
-                   "last_success_date": f"{engine.now_cn():%Y-%m-%d}"})
-        log(f"多标的看板刷新成功：{d['count']}/{d['count'] + d['failed']}，耗时 {d['elapsed']}s")
+        PF["run_count"] += 1
+        PF["generated_at"] = d.get("generated_at")
+        PF["count"] = d.get("count", 0)
+        if not d.get("refresh_ok", True):
+            # 抓取大面积失败：主缓存保留旧数据，状态里如实记录，且当天继续允许重试
+            PF["last_error"] = (f"刷新未写入：{d.get('refresh_failed')}/{len(pf.UNIVERSE)} "
+                                f"个标的失败，已保留{d.get('fallback_source') or '旧数据'}"
+                                f"（{d.get('refresh_hint', '')}）")
+            PF["last_failed_ts"] = time.time()
+            log(f"多标的看板刷新失败：{PF['last_error']}", "ERROR")
+        else:
+            PF.update({"last_error": None, "last_failed_ts": 0.0,
+                       "last_success_date": f"{engine.now_cn():%Y-%m-%d}"})
+            log(f"多标的看板刷新成功：{d['count']}/{d['count'] + d['failed']}，耗时 {d['elapsed']}s")
     except Exception as e:      # noqa: BLE001
         PF["last_error"] = f"{type(e).__name__}: {e}"
+        PF["last_failed_ts"] = time.time()
         log(f"多标的看板刷新失败：{PF['last_error']}", "ERROR")
     finally:
         PF["refreshing"] = False
@@ -273,6 +285,89 @@ def portfolio_data():
     return pf.load_cached() if pf else None
 
 
+# 从「服务器自身的网络」逐个探测行情源，用于定位云主机出站被限流/拦截的情况。
+# 只读、无副作用，不触发抓数，也不写入任何缓存。
+_EM_VAL_FILTER = quote("(SECURITY_CODE=\"002594\")(TRADE_DATE>='2026-01-01')")
+DIAG_TARGETS = (
+    ("腾讯实时行情", "https://qt.gtimg.cn/q=sz002594", "gbk"),
+    ("腾讯前复权日K", "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+     "?param=sz002594,day,,,10,qfq", "utf-8"),
+    ("东财实时行情", "https://push2.eastmoney.com/api/qt/stock/get"
+     "?secid=0.002594&fields=f43,f57,f58,f60", "utf-8"),
+    ("东财前复权日K", "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+     "?secid=0.002594&fields1=f1,f2,f3&fields2=f51,f52,f53,f54,f55,f56"
+     "&klt=101&fqt=1&beg=20260101&end=20500101&lmt=10", "utf-8"),
+    ("东财每日资金流", "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+     "?secid=0.002594&fields1=f1,f2,f3,f7&fields2=f51,f52,f53,f54,f55,f56"
+     "&lmt=10", "utf-8"),
+    ("东财估值/财报中心", "https://datacenter-web.eastmoney.com/api/data/v1/get"
+     "?reportName=RPT_VALUEANALYSIS_DET&columns=SECURITY_CODE,TRADE_DATE,PE_TTM"
+     f"&filter={_EM_VAL_FILTER}"
+     "&pageNumber=1&pageSize=10&sortColumns=TRADE_DATE&sortTypes=-1"
+     "&source=WEB&client=WEB", "utf-8"),
+)
+
+
+def diagnose_sources():
+    import concurrent.futures
+    import time
+
+    def probe(spec):
+        name, url, enc = spec
+        t0 = time.time()
+        out = {"name": name, "url": url.split("?")[0], "ok": False,
+               "detail": "", "sample": ""}
+        try:
+            raw = engine.http_get(url, encoding=enc, retries=1, timeout=8)
+            out["bytes"] = len(raw)
+            out["sample"] = raw[:120]
+            try:
+                j = json.loads(raw)
+                d = j.get("data")
+                if d is None and isinstance(j.get("result"), dict):
+                    d = j["result"].get("data")      # datacenter 返回 result.data 数组
+                if isinstance(d, list) and d:
+                    out["ok"], out["detail"] = True, f"{len(d)} 条记录"
+                elif isinstance(d, dict):
+                    arr = d.get("klines") or d.get("qfqday") or d.get("day") or []
+                    if not arr:
+                        for sub in d.values():        # 腾讯：data.<code>.qfqday
+                            if isinstance(sub, dict):
+                                arr = (sub.get("qfqday") or sub.get("day")
+                                       or sub.get("klines") or [])
+                                if arr:
+                                    break
+                    if arr:
+                        out["ok"], out["detail"] = True, f"{len(arr)} 条记录"
+                    elif d:
+                        out["ok"], out["detail"] = True, "data 对象非空"
+                    else:
+                        out["detail"] = "data 为空 / null（疑似被限流或接口拒绝）"
+                else:
+                    out["detail"] = f"data 类型 {type(d).__name__}（可能为空响应）"
+            except ValueError:
+                if "v_sz002594" in raw and len(raw) > 100:
+                    out["ok"], out["detail"] = True, "腾讯行情文本正常"
+                else:
+                    out["detail"] = "非 JSON / 非行情文本响应"
+        except Exception as e:      # noqa: BLE001
+            out["detail"] = f"{type(e).__name__}: {str(e)[:180]}"
+        out["ms"] = round((time.time() - t0) * 1000)
+        return out
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(DIAG_TARGETS)) as pool:
+        results = list(pool.map(probe, DIAG_TARGETS))
+    good = sum(1 for r in results if r["ok"])
+    return {
+        "checked_at": f"{engine.now_cn():%Y-%m-%d %H:%M:%S}",
+        "timezone": "Asia/Shanghai (UTC+8)", "good": good, "total": len(results),
+        "results": results,
+        "hint": ("日K 已内置腾讯回退：即使东财 push2his 全挂，K 线仍可抓取。"
+                 "若腾讯行情与腾讯日K 也失败，说明服务器出站网络/DNS 异常，"
+                 "请检查安全组、代理与 DNS 后重试。"),
+    }
+
+
 def scheduler_loop():
     log(f"定时调度已启动：{SCHEDULE_TEXT}，检查间隔 {CHECK_SECONDS}s")
     while not stop_event.is_set():
@@ -286,8 +381,11 @@ def scheduler_loop():
                 ok, msg = run_refresh("scheduled")
                 log(f"定时刷新{'成功' if ok else '失败'}：{msg}", "INFO" if ok else "ERROR")
             # 多标的看板独立调度：不依赖比亚迪刷新是否成功，同日幂等
+            # 失败后冷却 10 分钟再自动重试，避免数据源长时间不可达时每分钟刷一次全量抓数；
+            # 手动点击「立即刷新数据」不受冷却限制。
+            cooldown_ok = time.time() - PF.get("last_failed_ts", 0.0) > 600
             if (due_time and weekday_ok and PORTFOLIO_AUTO and pf is not None
-                    and not PF["refreshing"]
+                    and not PF["refreshing"] and cooldown_ok
                     and PF["last_success_date"] != f"{now:%Y-%m-%d}"):
                 portfolio_async("scheduled")
         except Exception as e:      # noqa: BLE001
@@ -414,7 +512,8 @@ ul{margin:8px 0;padding-left:20px}
 <body><div class="wrap">
 <h1>__TITLE__</h1>
 <div style="margin:0 0 12px"><a href="/portfolio" style="display:inline-block;padding:7px 14px;border:1px solid #2f5fd0;border-radius:8px;background:#2f5fd0;color:#fff;text-decoration:none;font-size:13px">→ 多标的投研看板（17 个标的 · 每个都有研报级详情）</a>
-<span class="small" style="margin-left:10px">横向对比 · 七节依据 · 风险点位 · 条件化买入建议</span></div>
+<span class="small" style="margin-left:10px">横向对比 · 七节依据 · 风险点位 · 条件化买入建议 ｜
+<a href="/api/diagnostics" style="color:#2f5fd0">数据源连通性诊断</a></span></div>
 <div class="meta small" style="margin-bottom:14px">__NAME__（__CODE__.SZ，A 股 / 人民币）｜ 数据时点 __ASOF__ ｜ __STATE__ ｜ 页面生成 __GEN__</div>
 
 <div class="topbar">
@@ -831,6 +930,7 @@ class BydRequestHandler(BaseHTTPRequestHandler):
                     self.send_html(render_index(ctx, load_history()))
                 return
             if path == "/health":
+                pd = portfolio_data() or {}
                 self.send_json({
                     "ok": S["ctx"] is not None,
                     "data_ready": S["ctx"] is not None,
@@ -842,11 +942,17 @@ class BydRequestHandler(BaseHTTPRequestHandler):
                     "refresh_in_progress": S["refreshing"],
                     "schedule": SCHEDULE_TEXT,
                     "timezone": "Asia/Shanghai (UTC+8)",
-                    "portfolio": {"module": "ok" if pf else "unavailable",
-                                  "cache_exists": portfolio_data() is not None,
-                                  "refreshing": PF["refreshing"],
-                                  "generated_at": PF["generated_at"],
-                                  "count": PF["count"]},
+                    "portfolio": {
+                        "module": "ok" if pf else "unavailable",
+                        "cache_exists": bool(pd),
+                        "refreshing": PF["refreshing"],
+                        "generated_at": PF["generated_at"],
+                        "count": PF["count"],
+                        "data_count": len(pd.get("items", [])),
+                        "stale": bool(pd.get("stale")),
+                        "fallback_source": pd.get("fallback_source"),
+                        "last_error": PF["last_error"],
+                    },
                 })
                 return
             if path == "/api/status":
@@ -907,13 +1013,14 @@ class BydRequestHandler(BaseHTTPRequestHandler):
                                    status=HTTPStatus.SERVICE_UNAVAILABLE)
                     return
                 d = portfolio_data()
-                if not d:
+                if not d or not d.get("items"):
+                    # 空数据不静默留白：触发一次后台抓数，并渲染带诊断说明的页面
                     portfolio_async("on-demand")
-                    self.send_html(pf.render_page(
-                        {"generated_at": f"{engine.now_cn():%Y-%m-%d %H:%M:%S}",
-                         "asof": "数据抓取中", "count": 0, "failed": 0,
-                         "items": [], "errors": [], "disclaimer": pf.DISCLAIMER},
-                        standalone=False))
+                    if d is None:
+                        d = {"generated_at": f"{engine.now_cn():%Y-%m-%d %H:%M:%S}",
+                             "asof": "数据抓取中", "count": 0, "failed": 0,
+                             "items": [], "errors": [], "disclaimer": pf.DISCLAIMER}
+                    self.send_html(pf.render_page(d, standalone=False))
                     return
                 self.send_html(pf.render_page(d, standalone=False))
                 return
@@ -927,10 +1034,18 @@ class BydRequestHandler(BaseHTTPRequestHandler):
                     self.send_json(d)
                 return
             if path == "/api/portfolio/status":
+                pd = portfolio_data() or {}
                 self.send_json({**PF, "module": "ok" if pf else "unavailable",
                                 "import_error": PF_IMPORT_ERROR,
                                 "auto": PORTFOLIO_AUTO,
-                                "cache_exists": portfolio_data() is not None})
+                                "cache_exists": bool(pd),
+                                "data_count": len(pd.get("items", [])),
+                                "stale": bool(pd.get("stale")),
+                                "fallback_source": pd.get("fallback_source"),
+                                "refresh_hint": pd.get("refresh_hint")})
+                return
+            if path == "/api/diagnostics":
+                self.send_json(diagnose_sources())
                 return
             if path == "/report":
                 ctx = S["ctx"]

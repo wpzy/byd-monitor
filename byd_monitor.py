@@ -403,19 +403,27 @@ class DataSource:
             notes.append("现价 / PE-TTM / PB 已通过腾讯行情与东方财富双源交叉校验，口径一致")
         return notes
 
-    # ---- 前复权日 K ----
+    # ---- 前复权日 K（东财主源 + 腾讯回退，多源冗余）----
+    # 云服务器上常见「东财 push2his 返回 data:null / 连接被拒」，单一数据源会让
+    # 全部标的直接失败。这里按「东财 HTTPS → 东财 HTTP → 东财备用节点 →
+    # 腾讯前复权 → 腾讯不复权」逐级降级；任一级拿到 >=60 根有效 K 线即采用。
     def kline(self, days=420):
+        days = int(days)
         beg = (now_cn() - dt.timedelta(days=int(days / 0.68) + 60)).strftime("%Y%m%d")
-        url = (f"https://push2his.eastmoney.com/api/qt/stock/kline/get?secid={self.secid}"
-               f"&fields1=f1,f2,f3,f4,f5,f6"
-               f"&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61"
-               f"&klt=101&fqt=1&beg={beg}&end=20500101&lmt=1000")
+        em_q = (f"/api/qt/stock/kline/get?secid={self.secid}"
+                f"&fields1=f1,f2,f3,f4,f5,f6"
+                f"&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61"
+                f"&klt=101&fqt=1&beg={beg}&end=20500101&lmt=1000")
+        tx_n = max(days, 420)
+        tx_fq = (f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+                 f"?param={self.txcode},day,,,{tx_n},qfq")
+        tx_raw = (f"https://web.ifzq.gtimg.cn/appstock/app/kline/kline"
+                  f"?param={self.txcode},day,,,{tx_n}")
 
-        def produce():
-            j = json.loads(http_get(url, timeout=20))
-            kl = ((j.get("data") or {}).get("klines") or [])
+        def parse_em(raw):
+            j = json.loads(raw)
             out = []
-            for line in kl:
+            for line in ((j.get("data") or {}).get("klines") or []):
                 p = line.split(",")
                 if len(p) < 11:
                     continue
@@ -425,12 +433,77 @@ class DataSource:
                     "amount": num(p[6]), "amplitude": num(p[7]),
                     "pct": num(p[8]), "change": num(p[9]), "turnover": num(p[10]),
                 })
-            return out
+            return out, True
 
-        data = self._cached("kline-" + url, 30, produce)
-        self._mark("东方财富 push2his（前复权日K）", url,
+        def parse_tx(raw):
+            j = json.loads(raw)
+            node = (j.get("data") or {}).get(self.txcode) or {}
+            # 个股一般返回 qfqday（前复权），ETF 通常只有 day（不复权）
+            fq = bool(node.get("qfqday"))
+            arr = node.get("qfqday") or node.get("day") or []
+            out, prev = [], None
+            for p in arr:
+                if not isinstance(p, (list, tuple)) or len(p) < 6:
+                    continue
+                o, c, h, l = num(p[1]), num(p[2]), num(p[3]), num(p[4])
+                if None in (o, c, h, l) or c <= 0:
+                    continue
+                out.append({
+                    "date": str(p[0]), "open": o, "close": c, "high": h, "low": l,
+                    "volume": num(p[5]),
+                    # 腾讯 6 列只有 OHLCV，成交额/换手率不编造，统一留空 → 页面显示 N/A
+                    "amount": num(p[6]) if len(p) > 6 else None,
+                    "amplitude": round((h - l) / prev * 100, 2) if prev else None,
+                    "pct": round((c / prev - 1) * 100, 2) if prev else None,
+                    "change": round(c - prev, 3) if prev else None,
+                    "turnover": None,
+                })
+                prev = c
+            return out, fq
+
+        sources = (
+            ("东方财富 push2his（前复权日K）", "https://push2his.eastmoney.com" + em_q,
+             parse_em, 2, 12),
+            ("东方财富 push2his（HTTP 备用）", "http://push2his.eastmoney.com" + em_q,
+             parse_em, 1, 8),
+            ("东方财富 33 节点（前复权日K）", "https://33.push2his.eastmoney.com" + em_q,
+             parse_em, 1, 8),
+            ("腾讯 fqkline（前复权日K）", tx_fq, parse_tx, 2, 10),
+            ("腾讯 kline（不复权日K）", tx_raw, parse_tx, 1, 8),
+        )
+        used = {}
+
+        def produce():
+            failures = []
+            for label, url, parser, retries, timeout in sources:
+                try:
+                    data, fq = parser(http_get(url, timeout=timeout, retries=retries))
+                    data = [x for x in data if x.get("date") and (x.get("close") or 0) > 0]
+                    if len(data) < 60:
+                        failures.append(f"{label}：仅 {len(data)} 根有效 K 线")
+                        continue
+                    used.update({"name": label, "url": url, "fq": fq,
+                                 "failures": failures})
+                    return data[-days:] if len(data) > days else data
+                except Exception as e:      # noqa: BLE001 - 单源失败继续下一源
+                    failures.append(f"{label}：{type(e).__name__}: {e}")
+            # 全部失败时抛异常：_cached 不会把空结果写进 30 分钟缓存，下次会立即重试
+            raise DataError("全部日K数据源不可用 → " + "；".join(failures[-4:]))
+
+        # 换 key 可绕开旧版可能已落盘的空 K 线缓存
+        data = self._cached(f"kline-v3-{self.symbol}-{days}", 30, produce)
+        if used:
+            name = used["name"]
+            if used["failures"]:
+                self.warnings.append("日K主源不可用，已回退 " + name +
+                                     "（" + "；".join(used["failures"][:2]) + "）")
+            if not used["fq"]:
+                self.warnings.append("日K为不复权数据（腾讯回退口径），除权缺口可能影响长周期指标")
+        else:
+            name = "日K缓存（30 分钟内复用）"
+        self._mark(name, used.get("url") or tx_fq,
                    data[-1]["date"] if data else None)
-        return data[-days:] if len(data) > days else data
+        return data
 
     # ---- 历史每日估值 ----
     def valuation_history(self, years=5):
